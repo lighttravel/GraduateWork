@@ -15,6 +15,7 @@ const PIPELINE_STEPS = [
 export default function CommandPanel() {
   const currentCommand = useCommandStore((state) => state.currentCommand);
   const recentEvents = useCommandStore((state) => state.recentEvents);
+  const commandHistory = useCommandStore((state) => state.commandHistory);
   const isExecuting = useCommandStore((state) => state.isExecuting);
   const currentStep = useCommandStore((state) => state.currentStep);
   const executionError = useCommandStore((state) => state.executionError);
@@ -68,6 +69,19 @@ export default function CommandPanel() {
             .map((event, index) => (
               <li key={`${event.type}-${index}`}>{event.type}</li>
             ))}
+        </ul>
+      </div>
+
+      <div>
+        <h3 className="subheading">Recent Commands</h3>
+        <ul className="event-list">
+          {commandHistory.length === 0 ? <li>No command history yet.</li> : null}
+          {commandHistory.slice(0, 5).map((command) => (
+            <li key={command.id} className="history-item">
+              <strong>{command.status.toUpperCase()}</strong>
+              <span>{command.user_input_text || 'Empty input'}</span>
+            </li>
+          ))}
         </ul>
       </div>
     </div>

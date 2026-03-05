@@ -21,21 +21,19 @@ export default function AudioPlayer({ audioBase64 }: AudioPlayerProps) {
     pause,
     stop,
     setVolume,
-    markUserInteraction,
     isPlaying,
     currentTime,
     duration,
     volume,
-    hasUserInteracted,
     error,
   } = useAudioPlayback(0.85);
 
   useEffect(() => {
-    if (!audioBase64 || !hasUserInteracted) {
+    if (!audioBase64) {
       return;
     }
     void play(audioBase64);
-  }, [audioBase64, hasUserInteracted, play]);
+  }, [audioBase64, play]);
 
   const hasAudio = Boolean(audioBase64);
   const progressPercent = duration > 0 ? Math.max(0, Math.min(100, (currentTime / duration) * 100)) : 0;
@@ -50,36 +48,22 @@ export default function AudioPlayer({ audioBase64 }: AudioPlayerProps) {
       </header>
 
       <div className="audio-controls">
-        {!hasUserInteracted ? (
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={() => {
-              markUserInteraction();
-            }}
-          >
-            Enable Audio
-          </button>
-        ) : (
-          <>
-            <button
-              type="button"
-              className="btn-secondary"
-              disabled={!hasAudio}
-              onClick={() => {
-                void play(audioBase64 ?? undefined);
-              }}
-            >
-              Play
-            </button>
-            <button type="button" className="btn-secondary" disabled={!hasAudio || !isPlaying} onClick={pause}>
-              Pause
-            </button>
-            <button type="button" className="btn-secondary" disabled={!hasAudio} onClick={stop}>
-              Stop
-            </button>
-          </>
-        )}
+        <button
+          type="button"
+          className="btn-secondary"
+          disabled={!hasAudio}
+          onClick={() => {
+            void play(audioBase64 ?? undefined);
+          }}
+        >
+          Play
+        </button>
+        <button type="button" className="btn-secondary" disabled={!hasAudio || !isPlaying} onClick={pause}>
+          Pause
+        </button>
+        <button type="button" className="btn-secondary" disabled={!hasAudio} onClick={stop}>
+          Stop
+        </button>
       </div>
 
       <div className="audio-progress-track">

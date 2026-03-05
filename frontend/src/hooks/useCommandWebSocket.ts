@@ -31,6 +31,13 @@ function extractControlJson(value: unknown): ControlJson | null {
   return value as ControlJson;
 }
 
+function extractCommandStatus(value: unknown): 'pending' | 'executed' | 'failed' | null {
+  if (value === 'pending' || value === 'executed' || value === 'failed') {
+    return value;
+  }
+  return null;
+}
+
 export function useCommandWebSocket(
   options: UseCommandWebSocketOptions = {}
 ): UseCommandWebSocketResult {
@@ -47,6 +54,7 @@ export function useCommandWebSocket(
   const setCurrentStep = useCommandStore((state) => state.setCurrentStep);
   const setExecutionError = useCommandStore((state) => state.setExecutionError);
   const addEvent = useCommandStore((state) => state.addEvent);
+  const addCommandToHistory = useCommandStore((state) => state.addCommandToHistory);
 
   const mergeCurrentCommand = useCallback(
     (patch: Partial<{
@@ -141,6 +149,10 @@ export function useCommandWebSocket(
           case 'device_executed':
             setCurrentStep('device_executed');
             break;
+          case 'device_stopped':
+            setCurrentStep('device_stopped');
+            setIsExecuting(false);
+            break;
           case 'tts_generating':
             setCurrentStep('tts_generating');
             break;
@@ -158,6 +170,39 @@ export function useCommandWebSocket(
             });
             break;
           case 'command_result':
+            {
+              const commandId = extractString(payload.command_id);
+              const controlJson = extractControlJson(payload.control_json);
+              const status = extractCommandStatus(payload.status);
+              const responseText = extractString(payload.response_text);
+              const executionError = extractString(payload.error);
+              const userInput =
+                extractString(payload.user_input) ??
+                useCommandStore.getState().currentCommand?.userInput ??
+                '';
+
+              if (commandId && controlJson && status) {
+                const now = new Date().toISOString();
+                addCommandToHistory({
+                  id: commandId,
+                  created_at: now,
+                  user_input_text: userInput,
+                  llm_response_text: responseText,
+                  control_json: controlJson,
+                  tts_audio_url: null,
+                  status,
+                  execution_error: executionError,
+                  user_feedback: null,
+                  updated_at: now,
+                });
+              }
+
+              if (executionError) {
+                setExecutionError(executionError);
+              } else {
+                setExecutionError(null);
+              }
+            }
             mergeCurrentCommand({
               commandId: extractString(payload.command_id),
               controlJson: extractControlJson(payload.control_json),
@@ -189,6 +234,7 @@ export function useCommandWebSocket(
     managerRef.current = manager;
     return manager;
   }, [
+    addCommandToHistory,
     addEvent,
     autoConnect,
     mergeCurrentCommand,

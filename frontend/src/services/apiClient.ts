@@ -90,9 +90,17 @@ export class WebSocketManager {
    * Connect to WebSocket server.
    */
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      console.warn('WebSocket already connected');
+    if (
+      this.ws?.readyState === WebSocket.OPEN ||
+      this.ws?.readyState === WebSocket.CONNECTING
+    ) {
+      console.warn('WebSocket already connected or connecting');
       return;
+    }
+
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
 
     this.isIntentionallyClosed = false;
@@ -104,6 +112,7 @@ export class WebSocketManager {
       this.ws.onopen = () => {
         console.log('WebSocket connected');
         this.reconnectAttempts = 0;
+        this.reconnectTimer = null;
         if (this.onOpen) this.onOpen();
       };
 

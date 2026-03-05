@@ -5,12 +5,10 @@ interface UseAudioPlaybackResult {
   pause: () => void;
   stop: () => void;
   setVolume: (value: number) => void;
-  markUserInteraction: () => void;
   isPlaying: boolean;
   currentTime: number;
   duration: number;
   volume: number;
-  hasUserInteracted: boolean;
   error: string | null;
 }
 
@@ -24,7 +22,6 @@ export function useAudioPlayback(initialVolume = 1): UseAudioPlaybackResult {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolumeState] = useState(Math.max(0, Math.min(1, initialVolume)));
-  const [hasUserInteracted, setHasUserInteracted] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const ensureAudio = useCallback((): HTMLAudioElement => {
@@ -92,7 +89,7 @@ export function useAudioPlayback(initialVolume = 1): UseAudioPlaybackResult {
     } catch (playError) {
       setIsPlaying(false);
       if (playError instanceof DOMException && playError.name === 'NotAllowedError') {
-        setError('Playback was blocked. Click Enable Audio first.');
+        setError('Autoplay was blocked by browser policy. Tap Play to start audio.');
       } else {
         setError('Unable to start audio playback.');
       }
@@ -122,11 +119,6 @@ export function useAudioPlayback(initialVolume = 1): UseAudioPlaybackResult {
     }
   }, []);
 
-  const markUserInteraction = useCallback(() => {
-    setHasUserInteracted(true);
-    setError(null);
-  }, []);
-
   useEffect(() => {
     return () => {
       if (audioRef.current) {
@@ -144,12 +136,10 @@ export function useAudioPlayback(initialVolume = 1): UseAudioPlaybackResult {
     pause,
     stop,
     setVolume,
-    markUserInteraction,
     isPlaying,
     currentTime,
     duration,
     volume,
-    hasUserInteracted,
     error,
   };
 }

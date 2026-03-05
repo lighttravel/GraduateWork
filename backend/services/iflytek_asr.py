@@ -124,6 +124,65 @@ class IFlytekASRClient:
         }
         return json.dumps(frame)
 
+    @staticmethod
+    def _merge_transcript_text(current_text: str, incoming_text: str) -> str:
+        """
+        Merge ASR text fragments while avoiding duplicated accumulation.
+
+        Some ASR streams return cumulative text chunks ("你" -> "你好" -> "你好。"),
+        while others return incremental deltas. This merger handles both.
+        """
+        if not incoming_text:
+            return current_text
+
+        if not current_text:
+            return incoming_text
+
+        # Cumulative chunk replaces previous text.
+        if incoming_text.startswith(current_text):
+            return incoming_text
+
+        # Ignore stale/shorter rollback fragments.
+        if current_text.startswith(incoming_text):
+            return current_text
+
+        # Merge by longest suffix-prefix overlap.
+        max_overlap = min(len(current_text), len(incoming_text))
+        overlap = 0
+        for size in range(max_overlap, 0, -1):
+            if current_text.endswith(incoming_text[:size]):
+                overlap = size
+                break
+
+        return f"{current_text}{incoming_text[overlap:]}"
+
+    @staticmethod
+    def _extract_text_from_ws(ws_list: list[dict]) -> str:
+        """
+        Extract recognized text from iFlytek `ws` result segments.
+
+        iFlytek may return multiple candidates in `cw`. Only the top candidate
+        should be used, otherwise candidates get concatenated and duplicate text appears.
+        """
+        text_parts: list[str] = []
+
+        for ws_item in ws_list:
+            cw_list = ws_item.get("cw", [])
+            if not cw_list:
+                continue
+
+            best_word = ""
+            for candidate in cw_list:
+                candidate_word = candidate.get("w", "")
+                if candidate_word:
+                    best_word = candidate_word
+                    break
+
+            if best_word:
+                text_parts.append(best_word)
+
+        return "".join(text_parts)
+
     async def transcribe_stream(
         self,
         audio_stream: AsyncIterator[bytes],
@@ -146,7 +205,7 @@ class IFlytekASRClient:
             ValueError: If transcription fails
         """
         auth_url = self._generate_auth_url()
-        full_transcript = []
+        transcript_state = {"text": ""}
 
         try:
             async with websockets.connect(auth_url) as ws:
@@ -155,7 +214,7 @@ class IFlytekASRClient:
 
                 # Start receiving task
                 receive_task = asyncio.create_task(
-                    self._receive_results(ws, full_transcript, on_partial, on_final)
+                    self._receive_results(ws, transcript_state, on_partial, on_final)
                 )
 
                 # Send audio frames
@@ -187,15 +246,14 @@ class IFlytekASRClient:
         finally:
             self.ws = None
 
-        # Combine all transcript parts
-        final_text = "".join(full_transcript)
+        final_text = transcript_state["text"]
         logger.info(f"Transcription complete: '{final_text}'")
         return final_text
 
     async def _receive_results(
         self,
         ws: WebSocketClientProtocol,
-        full_transcript: list,
+        transcript_state: dict[str, str],
         on_partial: Optional[Callable[[str], None]],
         on_final: Optional[Callable[[str], None]],
     ) -> None:
@@ -204,7 +262,7 @@ class IFlytekASRClient:
 
         Args:
             ws: WebSocket connection
-            full_transcript: List to accumulate transcript parts
+            transcript_state: Mutable transcript state container
             on_partial: Callback for partial results
             on_final: Callback for final result
         """
@@ -229,27 +287,28 @@ class IFlytekASRClient:
 
                     # Parse transcription segments
                     ws_list = ws_result.get("ws", [])
-                    text_parts = []
-
-                    for ws_item in ws_list:
-                        cw_list = ws_item.get("cw", [])
-                        for cw_item in cw_list:
-                            word = cw_item.get("w", "")
-                            text_parts.append(word)
-
-                    partial_text = "".join(text_parts)
+                    partial_text = self._extract_text_from_ws(ws_list)
 
                     if partial_text:
-                        full_transcript.append(partial_text)
-                        logger.debug(f"Partial result (status={status}): {partial_text}")
+                        merged_text = self._merge_transcript_text(
+                            transcript_state["text"],
+                            partial_text,
+                        )
+                        transcript_state["text"] = merged_text
+                        logger.debug(
+                            "Partial result (status=%s): raw='%s', merged='%s'",
+                            status,
+                            partial_text,
+                            merged_text,
+                        )
 
                         # Trigger callbacks
                         if status == 2:  # Final result
                             if on_final:
-                                on_final("".join(full_transcript))
+                                on_final(transcript_state["text"])
                         else:  # Partial result
                             if on_partial:
-                                on_partial("".join(full_transcript))
+                                on_partial(transcript_state["text"])
 
                     # Check if transcription is complete
                     if status == 2:

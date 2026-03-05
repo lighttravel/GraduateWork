@@ -1,218 +1,200 @@
 # AI-Powered Voice-Controlled Aromatherapy System
 
-A full-stack web application that enables natural language voice control of aromatherapy devices using AI-powered intent parsing.
+Full-stack web application for voice-driven aromatherapy control:
 
-## System Architecture
+`Voice Input -> iFlytek ASR -> GLM-4.7 LLM -> JSON Control -> Device Visualization + TTS`
 
-```
-Voice Input → iFlytek ASR → GLM-4.7 LLM → JSON Control Commands → Visualization + TTS Response
-```
+## Status
 
-### Key Features
+All planned phases (1-13) are implemented in this repository, including:
 
-- 🎙️ **Voice Control**: Push-to-talk voice input with real-time transcription (iFlytek ASR)
-- 🤖 **AI Intent Parsing**: Natural language understanding via GLM-4.7 LLM
-- 📊 **Real-Time Visualization**: Dynamic dashboard showing device state (scent, intensity, duration, rhythm)
-- 🔊 **Voice Feedback**: TTS confirmation of commands (iFlytek TTS)
-- 🌐 **Multi-Client Sync**: Real-time state synchronization across multiple dashboards
-- 📈 **Data Collection**: Training data export for model fine-tuning
+- Backend foundation, ASR/TTS/LLM integration, command execution pipeline
+- Frontend dashboard, voice capture, realtime device sync, audio playback
+- Feedback and training-data export endpoints
+- Global backend error handlers and frontend error boundary/connection status
+- Backend + frontend automated tests and E2E scaffold
 
 ## Tech Stack
 
 ### Backend
-- **FastAPI** - Web framework
-- **PostgreSQL** - Database (with JSONB support)
-- **iFlytek** - ASR & TTS services
-- **GLM-4.7** - LLM (Anthropic-compatible API)
-- **WebSocket** - Real-time bidirectional communication
+- FastAPI
+- SQLAlchemy (async) + PostgreSQL (JSONB)
+- iFlytek ASR/TTS WebSocket APIs
+- GLM-4.7 via Anthropic-compatible API
+- Native WebSocket for realtime events
 
-### Frontend (Coming in Phase 6)
-- **React** + **TypeScript** - UI framework
-- **Vite** - Build tool
-- **Recharts** - Visualization
-- **Socket.IO** - WebSocket client
+### Frontend
+- React 18 + TypeScript + Vite
+- Zustand state management
+- Axios
+- Recharts
+- Native WebSocket client manager
+- Vitest + Testing Library
+- Playwright (E2E)
 
 ## Project Structure
 
-```
+```text
 test1/
 ├── backend/
-│   ├── main.py                      # FastAPI app entry
-│   ├── config.py                    # Configuration management
-│   ├── database.py                  # Database connection
-│   ├── models.py                    # Data models
-│   ├── requirements.txt             # Python dependencies
-│   ├── .env.example                 # Environment template
+│   ├── main.py
+│   ├── config.py
+│   ├── database.py
+│   ├── models.py
+│   ├── requirements.txt
 │   ├── migrations/
-│   │   └── 001_initial_schema.sql   # Database schema
+│   ├── middleware/
 │   ├── repositories/
-│   │   └── command_repository.py    # Data access layer
-│   ├── services/                    # Business logic (Phase 2-4)
-│   ├── routers/                     # API endpoints (Phase 3-5)
-│   └── tests/                       # Unit & integration tests
-├── frontend/                        # React app (Phase 6+)
+│   ├── routers/
+│   ├── services/
+│   └── tests/
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   ├── pages/
+│   │   ├── services/
+│   │   ├── store/
+│   │   └── types/
+│   ├── e2e/
+│   └── package.json
+├── PROJECT_HANDOFF.md
+├── EXECUTION_GUIDE.md
 └── README.md
 ```
 
 ## Quick Start
 
-### Prerequisites
+## 1) Backend
 
-- Python 3.11+
-- PostgreSQL 15+
-- Node.js 20+ (for frontend)
+```bash
+cd backend
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Linux/macOS:
+# source venv/bin/activate
 
-### Backend Setup
-
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd test1/backend
-   ```
-
-2. **Create virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure environment**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your credentials
-   ```
-
-5. **Initialize database**
-   ```bash
-   psql -U postgres -c "CREATE DATABASE aromatherapy_db;"
-   psql -U postgres -d aromatherapy_db -f migrations/001_initial_schema.sql
-   ```
-
-6. **Run the server**
-   ```bash
-   python main.py
-   # Or with uvicorn:
-   uvicorn main:app --reload --host 0.0.0.0 --port 8000
-   ```
-
-7. **Access the API**
-   - API Docs: http://localhost:8000/docs
-   - Health Check: http://localhost:8000/health
-
-## Configuration
-
-All configuration is managed via environment variables in `.env`:
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `DATABASE_URL` | PostgreSQL connection string | ✅ |
-| `IFLYTEK_ASR_APPID` | iFlytek ASR App ID | ✅ |
-| `IFLYTEK_ASR_API_SECRET` | iFlytek ASR API Secret | ✅ |
-| `IFLYTEK_ASR_API_KEY` | iFlytek ASR API Key | ✅ |
-| `IFLYTEK_TTS_APPID` | iFlytek TTS App ID | ✅ |
-| `IFLYTEK_TTS_API_SECRET` | iFlytek TTS API Secret | ✅ |
-| `IFLYTEK_TTS_API_KEY` | iFlytek TTS API Key | ✅ |
-| `ANTHROPIC_AUTH_TOKEN` | GLM-4.7 API Token | ✅ |
-| `ANTHROPIC_BASE_URL` | GLM-4.7 API Base URL | ✅ |
-| `CORS_ORIGINS` | Allowed frontend origins | ❌ |
-| `APP_ENV` | Environment (development/production) | ❌ |
-| `LOG_LEVEL` | Logging level (DEBUG/INFO/WARNING/ERROR) | ❌ |
-
-**Security Note**: NEVER commit `.env` to version control. API credentials are for development/testing only.
-
-## Development Roadmap
-
-- [x] **Phase 1**: Backend Foundation (FastAPI, DB, config) ✅
-- [ ] **Phase 2**: LLM Intent Parsing (GLM-4.7 integration)
-- [ ] **Phase 3**: iFlytek ASR Integration (WebSocket)
-- [ ] **Phase 4**: iFlytek TTS Integration (WebSocket)
-- [ ] **Phase 5**: Command Execution Pipeline
-- [ ] **Phase 6**: Frontend Foundation (React + TypeScript)
-- [ ] **Phase 7**: Voice Capture Component (push-to-talk)
-- [ ] **Phase 8**: Visualization Dashboard (charts, device state)
-- [ ] **Phase 9**: Audio Playback Component
-- [ ] **Phase 10**: Real-Time Multi-Client Sync (WebSocket rooms)
-- [ ] **Phase 11**: Data Collection & Export
-- [ ] **Phase 12**: Error Handling & Edge Cases
-- [ ] **Phase 13**: Testing (80%+ coverage)
-
-## API Endpoints (Current)
-
-### Health Check
-```http
-GET /health
+pip install -r requirements.txt
 ```
 
-Returns service status and configuration info.
+Create `.env` from `.env.example` and fill required keys:
 
-**Response:**
-```json
-{
-  "status": "healthy",
-  "environment": "development",
-  "services": {
-    "database": "connected",
-    "iflytek_asr": "configured",
-    "iflytek_tts": "configured",
-    "llm": "configured"
-  }
-}
+- `DATABASE_URL`
+- `IFLYTEK_ASR_*`
+- `IFLYTEK_TTS_*`
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_BASE_URL`
+
+Initialize DB:
+
+```bash
+psql -U postgres -c "CREATE DATABASE aromatherapy_db;"
+psql -U postgres -d aromatherapy_db -f migrations/001_initial_schema.sql
 ```
 
-## Database Schema
+Run backend:
 
-### `aromatherapy_commands` Table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | UUID | Primary key |
-| `created_at` | TIMESTAMPTZ | Command creation timestamp |
-| `user_input_text` | TEXT | Original voice input (transcribed) |
-| `llm_response_text` | TEXT | LLM natural language response |
-| `control_json` | JSONB | Structured control parameters |
-| `tts_audio_url` | TEXT | URL to TTS audio file |
-| `status` | TEXT | Execution status (pending/executed/failed) |
-| `execution_error` | TEXT | Error message if failed |
-| `user_feedback` | INTEGER | User rating (1-5 stars) |
-| `updated_at` | TIMESTAMPTZ | Last update timestamp |
-
-### Control JSON Schema
-
-```json
-{
-  "scent_type": "lemon | lavender | woody | floral | mixed",
-  "intensity": 1-10,
-  "duration_minutes": 5-120,
-  "release_rhythm": "gradual | pulse | intermittent",
-  "mixing_ratios": {
-    "lemon": 0.6,
-    "lavender": 0.4
-  }
-}
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+## 2) Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend default URL: `http://localhost:5173`  
+Backend docs: `http://localhost:8000/docs`  
+Health check: `http://localhost:8000/health`
+
+## Optional: Local Proxy (example `127.0.0.1:7897`)
+
+If package installs fail due network restrictions, configure proxy for the terminal session:
+
+```powershell
+$env:HTTP_PROXY='http://127.0.0.1:7897'
+$env:HTTPS_PROXY='http://127.0.0.1:7897'
+```
+
+For Conda:
+
+```powershell
+conda config --set proxy_servers.http http://127.0.0.1:7897
+conda config --set proxy_servers.https http://127.0.0.1:7897
+```
+
+## API Endpoints
+
+### HTTP
+- `GET /health`
+- `POST /api/tts`
+- `GET /api/tts/voices`
+- `PATCH /api/commands/{command_id}/feedback`
+- `GET /api/export/training-data?format=csv|jsonl`
+
+### WebSocket
+- `WS /api/ws/asr`
+- `WS /api/ws/commands`
+
+## Realtime Command Event Types
+
+- `llm_processing`
+- `command_generated`
+- `command_saved`
+- `device_executing`
+- `device_executed`
+- `tts_generating`
+- `tts_ready`
+- `execution_complete`
+- `execution_error`
+- `device_status`
+- `device_stopped`
+- `command_result`
 
 ## Testing
 
+### Backend
+
+From repo root:
+
 ```bash
-# Run all tests
-pytest
+python -m pytest -q backend/tests
+```
 
-# Run with coverage
-pytest --cov=. --cov-report=html
+Or from backend directory:
 
-# Run specific test file
-pytest tests/test_intent_parser.py
+```bash
+cd backend
+pytest -q tests
+```
+
+### Frontend
+
+```bash
+cd frontend
+npm run test:run
+npm run build
+```
+
+### E2E
+
+List tests (no browser install required):
+
+```bash
+cd frontend
+npm run test:e2e -- --list
+```
+
+Run E2E (requires Playwright browsers installed):
+
+```bash
+npm run test:e2e
 ```
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Contributing
-
-This is a graduate research project. Contributions are welcome via pull requests.
+MIT License.

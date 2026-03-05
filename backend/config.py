@@ -2,52 +2,68 @@
 Configuration management using Pydantic Settings.
 Loads and validates environment variables from .env file.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field, validator
+from pathlib import Path
 from typing import List
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parent
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
+    model_config = SettingsConfigDict(
+        env_file=BACKEND_DIR / ".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
     # Database
-    database_url: str = Field(..., env="DATABASE_URL")
+    database_url: str = Field(..., validation_alias="DATABASE_URL")
 
     # iFlytek ASR (Automatic Speech Recognition)
-    iflytek_asr_appid: str = Field(..., env="IFLYTEK_ASR_APPID")
-    iflytek_asr_api_secret: str = Field(..., env="IFLYTEK_ASR_API_SECRET")
-    iflytek_asr_api_key: str = Field(..., env="IFLYTEK_ASR_API_KEY")
+    iflytek_asr_appid: str = Field(..., validation_alias="IFLYTEK_ASR_APPID")
+    iflytek_asr_api_secret: str = Field(..., validation_alias="IFLYTEK_ASR_API_SECRET")
+    iflytek_asr_api_key: str = Field(..., validation_alias="IFLYTEK_ASR_API_KEY")
 
     # iFlytek TTS (Text-to-Speech)
-    iflytek_tts_appid: str = Field(..., env="IFLYTEK_TTS_APPID")
-    iflytek_tts_api_secret: str = Field(..., env="IFLYTEK_TTS_API_SECRET")
-    iflytek_tts_api_key: str = Field(..., env="IFLYTEK_TTS_API_KEY")
+    iflytek_tts_appid: str = Field(..., validation_alias="IFLYTEK_TTS_APPID")
+    iflytek_tts_api_secret: str = Field(..., validation_alias="IFLYTEK_TTS_API_SECRET")
+    iflytek_tts_api_key: str = Field(..., validation_alias="IFLYTEK_TTS_API_KEY")
 
     # GLM-4.7 LLM (via Anthropic-compatible API)
-    anthropic_auth_token: str = Field(..., env="ANTHROPIC_AUTH_TOKEN")
-    anthropic_base_url: str = Field(..., env="ANTHROPIC_BASE_URL")
+    anthropic_auth_token: str = Field(..., validation_alias="ANTHROPIC_AUTH_TOKEN")
+    anthropic_base_url: str = Field(..., validation_alias="ANTHROPIC_BASE_URL")
+    anthropic_model: str = Field(default="glm-4.7", validation_alias="ANTHROPIC_MODEL")
 
     # Application
-    app_env: str = Field(default="development", env="APP_ENV")
-    app_host: str = Field(default="0.0.0.0", env="APP_HOST")
-    app_port: int = Field(default=8000, env="APP_PORT")
+    app_env: str = Field(default="development", validation_alias="APP_ENV")
+    app_host: str = Field(default="0.0.0.0", validation_alias="APP_HOST")
+    app_port: int = Field(default=8000, validation_alias="APP_PORT")
     cors_origins: str = Field(
         default="http://localhost:5173,http://localhost:3000",
-        env="CORS_ORIGINS"
+        validation_alias="CORS_ORIGINS",
     )
 
     # Logging
-    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
-    @validator("cors_origins")
-    def parse_cors_origins(cls, v: str) -> List[str]:
-        """Parse comma-separated CORS origins into a list."""
-        return [origin.strip() for origin in v.split(",")]
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def validate_cors_origins(cls, value: str | List[str]) -> str:
+        """Validate CORS origins shape while keeping env format compatibility."""
+        if isinstance(value, list):
+            return ",".join([origin.strip() for origin in value if origin.strip()])
+        if isinstance(value, str):
+            return value
+        raise ValueError("CORS_ORIGINS must be a comma-separated string or list.")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Parsed CORS origins for FastAPI middleware."""
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
 
 # Global settings instance

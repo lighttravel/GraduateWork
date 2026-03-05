@@ -2,9 +2,11 @@
 ASR WebSocket Router.
 Provides WebSocket endpoint for real-time audio transcription.
 """
+import audioop
 import asyncio
+import io
 import logging
-from typing import Optional
+import wave
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
 
@@ -13,6 +15,55 @@ from services.iflytek_asr import asr_client
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+TARGET_SAMPLE_RATE = 16000
+TARGET_CHANNELS = 1
+TARGET_SAMPLE_WIDTH = 2
+
+
+def _decode_wav_chunk(wav_bytes: bytes) -> bytes:
+    """Convert WAV bytes to PCM 16kHz mono 16-bit for iFlytek ASR."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav_reader:
+        channels = wav_reader.getnchannels()
+        sample_width = wav_reader.getsampwidth()
+        sample_rate = wav_reader.getframerate()
+        pcm_data = wav_reader.readframes(wav_reader.getnframes())
+
+    if sample_width not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
+
+    if sample_width != TARGET_SAMPLE_WIDTH:
+        pcm_data = audioop.lin2lin(pcm_data, sample_width, TARGET_SAMPLE_WIDTH)
+        sample_width = TARGET_SAMPLE_WIDTH
+
+    if channels != TARGET_CHANNELS:
+        if channels == 2:
+            pcm_data = audioop.tomono(pcm_data, sample_width, 0.5, 0.5)
+        else:
+            raise ValueError(f"Unsupported WAV channel count: {channels}")
+        channels = TARGET_CHANNELS
+
+    if sample_rate != TARGET_SAMPLE_RATE:
+        pcm_data, _ = audioop.ratecv(
+            pcm_data,
+            sample_width,
+            channels,
+            sample_rate,
+            TARGET_SAMPLE_RATE,
+            None,
+        )
+
+    return pcm_data
+
+
+def _normalize_audio_chunk(chunk: bytes) -> bytes:
+    """
+    Accept WAV or raw PCM chunks.
+    Converts WAV to raw PCM expected by iFlytek.
+    """
+    if len(chunk) >= 12 and chunk[:4] == b"RIFF" and chunk[8:12] == b"WAVE":
+        return _decode_wav_chunk(chunk)
+
+    return chunk
 
 
 @router.websocket("/ws/asr")
@@ -22,7 +73,7 @@ async def asr_websocket(websocket: WebSocket):
 
     Protocol:
         1. Client connects to /ws/asr
-        2. Client sends binary audio frames (PCM 16kHz 16bit mono)
+        2. Client sends binary audio frames (WAV or PCM)
         3. Server forwards to iFlytek ASR via WebSocket
         4. Server streams back transcription events:
            - {"type": "partial", "text": "..."} - Partial transcription
@@ -30,16 +81,13 @@ async def asr_websocket(websocket: WebSocket):
            - {"type": "error", "message": "..."} - Error occurred
 
     Audio Format:
-        - Sample Rate: 16kHz
-        - Bit Depth: 16bit
-        - Channels: Mono
-        - Encoding: PCM (raw audio)
+        - Preferred upload: WAV (16kHz mono 16-bit) or raw PCM
+        - Server normalizes incoming WAV to raw PCM for iFlytek ASR
     """
     await websocket.accept()
     logger.info("ASR WebSocket client connected")
 
     audio_queue: asyncio.Queue = asyncio.Queue()
-    transcription_complete = asyncio.Event()
     final_transcript = []
 
     async def audio_stream_generator():
@@ -59,8 +107,21 @@ async def asr_websocket(websocket: WebSocket):
 
                 if "bytes" in data:
                     audio_chunk = data["bytes"]
-                    await audio_queue.put(audio_chunk)
-                    logger.debug(f"Received audio chunk: {len(audio_chunk)} bytes")
+                    if audio_chunk is None:
+                        continue
+
+                    try:
+                        normalized_chunk = _normalize_audio_chunk(audio_chunk)
+                    except ValueError as decode_error:
+                        logger.error(f"Invalid audio chunk: {decode_error}")
+                        continue
+
+                    await audio_queue.put(normalized_chunk)
+                    logger.debug(
+                        "Received audio chunk: %s bytes (normalized: %s bytes)",
+                        len(audio_chunk),
+                        len(normalized_chunk),
+                    )
 
                 elif "text" in data:
                     # Handle control messages
@@ -90,7 +151,6 @@ async def asr_websocket(websocket: WebSocket):
         logger.info(f"Final transcription: {text}")
         final_transcript.append(text)
         asyncio.create_task(send_result("final", text))
-        transcription_complete.set()
 
     async def send_result(result_type: str, text: str):
         """Send transcription result to client."""

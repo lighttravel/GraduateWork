@@ -22,9 +22,35 @@ class LLMService:
             api_key=settings.anthropic_auth_token,
             base_url=settings.anthropic_base_url,
         )
-        self.model = "glm-4"  # GLM-4.7 model identifier
+        self.model = settings.anthropic_model
         self.max_retries = 3
         logger.info(f"LLM Service initialized with model: {self.model}")
+
+    @staticmethod
+    def _extract_response_text(message: Any) -> Optional[str]:
+        """
+        Extract assistant text from Anthropic-compatible message content blocks.
+
+        Some providers return extra blocks (e.g. `thinking`) before the final `text` block.
+        We should ignore non-text blocks and pick the first non-empty text block.
+        """
+        content = getattr(message, "content", None)
+        if not content:
+            return None
+
+        for block in content:
+            block_type = getattr(block, "type", None)
+            block_text = getattr(block, "text", None)
+            if block_type == "text" and isinstance(block_text, str) and block_text.strip():
+                return block_text
+
+        # Fallback for provider variants that may not expose `type`.
+        for block in content:
+            block_text = getattr(block, "text", None)
+            if isinstance(block_text, str) and block_text.strip():
+                return block_text
+
+        return None
 
     async def generate_response(
         self,
@@ -64,14 +90,14 @@ class LLMService:
                     ],
                 )
 
-                # Extract text content from response
-                if message.content and len(message.content) > 0:
-                    response_text = message.content[0].text
+                response_text = self._extract_response_text(message)
+                if response_text:
                     logger.info(f"LLM response received ({len(response_text)} chars)")
                     return response_text
-                else:
-                    logger.warning("LLM returned empty response")
-                    return None
+
+                block_types = [getattr(block, "type", "unknown") for block in (message.content or [])]
+                logger.warning(f"LLM returned no usable text block (types={block_types})")
+                return None
 
             except RateLimitError as e:
                 retry_count += 1

@@ -9,8 +9,8 @@ Orchestrates the full command execution pipeline:
 6. Emit real-time events
 """
 import logging
-from typing import Optional, Dict, Any, Callable
-from uuid import UUID
+from collections.abc import Awaitable, Callable
+from typing import Optional, Dict, Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,8 @@ from services.iflytek_tts import tts_client
 from services.device_controller import device_controller
 
 logger = logging.getLogger(__name__)
+
+EventCallback = Callable[[str, Dict[str, Any]], Awaitable[None] | None]
 
 
 class CommandExecutorService:
@@ -34,7 +36,7 @@ class CommandExecutorService:
         self,
         user_input_text: str,
         session: AsyncSession,
-        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_event: Optional[EventCallback] = None,
     ) -> Dict[str, Any]:
         """
         Execute a complete command pipeline from user input to device control.
@@ -71,7 +73,7 @@ class CommandExecutorService:
         try:
             # ========== Step 1: Parse Intent with LLM ==========
             logger.info(f"[Step 1/5] Parsing user input with LLM: '{user_input_text}'")
-            self._emit_event(on_event, "llm_processing", {"text": user_input_text})
+            await self._emit_event(on_event, "llm_processing", {"text": user_input_text})
 
             parse_result = await intent_parser.parse_command(user_input_text)
 
@@ -82,7 +84,7 @@ class CommandExecutorService:
             response_text = parse_result["response_text"]
 
             logger.info(f"[Step 1/5] ✓ LLM parsing successful: {control_json}")
-            self._emit_event(
+            await self._emit_event(
                 on_event,
                 "command_generated",
                 {
@@ -102,11 +104,11 @@ class CommandExecutorService:
             command_id = command.id
 
             logger.info(f"[Step 2/5] ✓ Command saved: ID={command_id}")
-            self._emit_event(on_event, "command_saved", {"command_id": str(command_id)})
+            await self._emit_event(on_event, "command_saved", {"command_id": str(command_id)})
 
             # ========== Step 3: Execute on Device ==========
             logger.info("[Step 3/5] Executing command on device")
-            self._emit_event(on_event, "device_executing", {"command_id": str(command_id)})
+            await self._emit_event(on_event, "device_executing", {"command_id": str(command_id)})
 
             device_success = await device_controller.execute_command(control_json)
 
@@ -114,11 +116,11 @@ class CommandExecutorService:
                 raise RuntimeError("Device command execution failed")
 
             logger.info("[Step 3/5] ✓ Device command executed successfully")
-            self._emit_event(on_event, "device_executed", {"command_id": str(command_id)})
+            await self._emit_event(on_event, "device_executed", {"command_id": str(command_id)})
 
             # ========== Step 4: Generate TTS Audio ==========
             logger.info("[Step 4/5] Generating TTS audio response")
-            self._emit_event(on_event, "tts_generating", {"text": response_text})
+            await self._emit_event(on_event, "tts_generating", {"text": response_text})
 
             tts_audio = await tts_client.synthesize(
                 text=response_text,
@@ -133,7 +135,7 @@ class CommandExecutorService:
             if tts_audio:
                 tts_audio_base64 = base64.b64encode(tts_audio).decode("utf-8")
                 logger.info(f"[Step 4/5] ✓ TTS audio generated: {len(tts_audio)} bytes")
-                self._emit_event(
+                await self._emit_event(
                     on_event,
                     "tts_ready",
                     {
@@ -150,7 +152,7 @@ class CommandExecutorService:
             await repository.update_status(command_id, "executed")
 
             logger.info("[Step 5/5] ✓ Command execution pipeline complete")
-            self._emit_event(
+            await self._emit_event(
                 on_event,
                 "execution_complete",
                 {
@@ -184,7 +186,7 @@ class CommandExecutorService:
                     logger.error(f"Failed to update command status: {db_error}")
 
             # Emit error event
-            self._emit_event(
+            await self._emit_event(
                 on_event,
                 "execution_error",
                 {
@@ -215,9 +217,9 @@ class CommandExecutorService:
         logger.info("Stopping device via command executor")
         return await device_controller.stop()
 
-    def _emit_event(
+    async def _emit_event(
         self,
-        on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+        on_event: Optional[EventCallback],
         event_type: str,
         data: Dict[str, Any],
     ) -> None:
@@ -231,7 +233,9 @@ class CommandExecutorService:
         """
         if on_event:
             try:
-                on_event(event_type, data)
+                callback_result = on_event(event_type, data)
+                if isinstance(callback_result, Awaitable):
+                    await callback_result
             except Exception as e:
                 logger.error(f"Error emitting event '{event_type}': {e}")
 

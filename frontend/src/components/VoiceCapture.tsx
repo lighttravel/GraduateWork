@@ -28,9 +28,10 @@ export default function VoiceCapture({ onFinalTranscription }: VoiceCaptureProps
     error: audioError,
     hasPermission,
   } = useAudioCapture({
-    onPCMChunk: (chunk) => {
+    onAudioChunk: (chunk) => {
       sendAudio(chunk);
     },
+    transportFormat: 'wav',
   });
 
   const clearDisconnectTimer = useCallback(() => {
@@ -56,8 +57,13 @@ export default function VoiceCapture({ onFinalTranscription }: VoiceCaptureProps
       return;
     }
 
-    await startRecording();
-  }, [clearDisconnectTimer, connect, isRecording, resetTranscription, startRecording]);
+    const started = await startRecording();
+    if (!started) {
+      disconnect();
+      setInteractionError('Unable to start microphone recording.');
+      setIsRecognizing(false);
+    }
+  }, [clearDisconnectTimer, connect, disconnect, isRecording, resetTranscription, startRecording]);
 
   const handleStopRecording = useCallback(() => {
     if (!isRecording) {

@@ -521,6 +521,17 @@ body {
   font-size: 0.83rem;
 }
 
+.history-item {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.history-item strong {
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--ink-muted);
+}
+
 .voice-capture {
   display: grid;
   gap: 0.55rem;

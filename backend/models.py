@@ -5,10 +5,10 @@ Uses Pydantic for validation and SQLAlchemy for database ORM.
 from datetime import datetime
 from typing import Optional, Dict, Literal
 from uuid import UUID
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import Column, String, Text, Integer, JSON, DateTime
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
 import uuid
 
@@ -32,13 +32,6 @@ class MixingRatios(BaseModel):
     woody: Optional[float] = Field(None, ge=0, le=1)
     floral: Optional[float] = Field(None, ge=0, le=1)
 
-    @validator("*")
-    def validate_ratio(cls, v):
-        """Ensure ratios are between 0 and 1."""
-        if v is not None and (v < 0 or v > 1):
-            raise ValueError("Mixing ratio must be between 0 and 1")
-        return v
-
 
 class ControlJson(BaseModel):
     """
@@ -51,12 +44,12 @@ class ControlJson(BaseModel):
     release_rhythm: ReleaseRhythm = Field(..., description="Release pattern")
     mixing_ratios: Optional[MixingRatios] = Field(None, description="Scent mixing ratios (for mixed type)")
 
-    @validator("mixing_ratios")
-    def validate_mixing_for_mixed_scent(cls, v, values):
+    @model_validator(mode="after")
+    def validate_mixing_for_mixed_scent(self):
         """If scent_type is 'mixed', mixing_ratios must be provided."""
-        if values.get("scent_type") == "mixed" and v is None:
+        if self.scent_type == "mixed" and self.mixing_ratios is None:
             raise ValueError("mixing_ratios required when scent_type is 'mixed'")
-        return v
+        return self
 
 
 class CommandCreate(BaseModel):
@@ -77,8 +70,7 @@ class CommandResponse(BaseModel):
     user_feedback: Optional[int]
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class FeedbackUpdate(BaseModel):

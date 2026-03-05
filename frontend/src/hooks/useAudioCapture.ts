@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface UseAudioCaptureOptions {
   onPCMChunk?: (chunk: Int16Array) => void;
+  onAudioChunk?: (chunk: Blob) => void;
   targetSampleRate?: number;
   bufferSize?: number;
+  transportFormat?: 'wav' | 'pcm';
 }
 
 interface UseAudioCaptureResult {
-  startRecording: () => Promise<void>;
+  startRecording: () => Promise<boolean>;
   stopRecording: () => void;
   audioBlob: Blob | null;
   audioChunks: Blob[];
@@ -97,8 +99,49 @@ function int16ToArrayBuffer(chunk: Int16Array): ArrayBuffer {
   return buffer;
 }
 
+function int16ToWavArrayBuffer(chunk: Int16Array, sampleRate: number): ArrayBuffer {
+  const bytesPerSample = 2;
+  const channelCount = 1;
+  const dataSize = chunk.length * bytesPerSample;
+  const wavBuffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(wavBuffer);
+  let offset = 0;
+
+  const writeString = (value: string) => {
+    for (let i = 0; i < value.length; i += 1) {
+      view.setUint8(offset + i, value.charCodeAt(i));
+    }
+    offset += value.length;
+  };
+
+  writeString('RIFF');
+  view.setUint32(offset, 36 + dataSize, true);
+  offset += 4;
+  writeString('WAVE');
+  writeString('fmt ');
+  view.setUint32(offset, 16, true);
+  offset += 4;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint16(offset, channelCount, true);
+  offset += 2;
+  view.setUint32(offset, sampleRate, true);
+  offset += 4;
+  view.setUint32(offset, sampleRate * channelCount * bytesPerSample, true);
+  offset += 4;
+  view.setUint16(offset, channelCount * bytesPerSample, true);
+  offset += 2;
+  view.setUint16(offset, bytesPerSample * 8, true);
+  offset += 2;
+  writeString('data');
+  view.setUint32(offset, dataSize, true);
+
+  new Int16Array(wavBuffer, 44, chunk.length).set(chunk);
+  return wavBuffer;
+}
+
 export function useAudioCapture(options: UseAudioCaptureOptions = {}): UseAudioCaptureResult {
-  const { onPCMChunk, targetSampleRate = 16000, bufferSize = 4096 } = options;
+  const { onPCMChunk, onAudioChunk, targetSampleRate = 16000, bufferSize = 4096, transportFormat = 'wav' } = options;
 
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
@@ -136,9 +179,9 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}): UseAudioC
     }
   }, []);
 
-  const startRecording = useCallback(async () => {
+  const startRecording = useCallback(async (): Promise<boolean> => {
     if (isRecording) {
-      return;
+      return true;
     }
 
     setError(null);
@@ -187,10 +230,20 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}): UseAudioC
         }
 
         pcmChunksRef.current.push(pcmChunk);
-        chunkBlobsRef.current.push(new Blob([int16ToArrayBuffer(pcmChunk)], { type: 'application/octet-stream' }));
 
         if (onPCMChunk) {
           onPCMChunk(pcmChunk);
+        }
+
+        const encodedChunk =
+          transportFormat === 'wav'
+            ? new Blob([int16ToWavArrayBuffer(pcmChunk, targetSampleRate)], { type: 'audio/wav' })
+            : new Blob([int16ToArrayBuffer(pcmChunk)], { type: 'application/octet-stream' });
+
+        chunkBlobsRef.current.push(encodedChunk);
+
+        if (onAudioChunk) {
+          onAudioChunk(encodedChunk);
         }
       };
 
@@ -198,13 +251,15 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}): UseAudioC
       processorNode.connect(audioContext.destination);
 
       setIsRecording(true);
+      return true;
     } catch (captureError) {
       setHasPermission(false);
       setError(mapMediaError(captureError));
       cleanupResources();
       setIsRecording(false);
+      return false;
     }
-  }, [bufferSize, cleanupResources, isRecording, onPCMChunk, targetSampleRate]);
+  }, [bufferSize, cleanupResources, isRecording, onAudioChunk, onPCMChunk, targetSampleRate, transportFormat]);
 
   const stopRecording = useCallback(() => {
     if (!isRecording) {
@@ -218,11 +273,15 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}): UseAudioC
 
     if (pcmChunksRef.current.length > 0) {
       const merged = mergeInt16Chunks(pcmChunksRef.current);
-      setAudioBlob(new Blob([int16ToArrayBuffer(merged)], { type: 'audio/pcm' }));
+      if (transportFormat === 'wav') {
+        setAudioBlob(new Blob([int16ToWavArrayBuffer(merged, targetSampleRate)], { type: 'audio/wav' }));
+      } else {
+        setAudioBlob(new Blob([int16ToArrayBuffer(merged)], { type: 'audio/pcm' }));
+      }
     } else {
       setAudioBlob(null);
     }
-  }, [cleanupResources, isRecording]);
+  }, [cleanupResources, isRecording, targetSampleRate, transportFormat]);
 
   useEffect(() => {
     return () => {

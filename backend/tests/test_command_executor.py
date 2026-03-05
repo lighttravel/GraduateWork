@@ -110,3 +110,50 @@ async def test_execute_command_marks_failed_when_device_fails(monkeypatch):
 
     assert "execution_error" in events
     assert any(status == "failed" for _, status, _ in saved_status_updates)
+
+
+@pytest.mark.asyncio
+async def test_execute_command_supports_async_event_callback(monkeypatch):
+    class FakeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def create_command(self, *_args, **_kwargs):
+            return SimpleNamespace(id=uuid4())
+
+        async def update_status(self, command_id, status, execution_error=None):
+            return SimpleNamespace(id=command_id, status=status, execution_error=execution_error)
+
+    async def fake_parse_command(_text):
+        return {
+            "control_json": {
+                "scent_type": "woody",
+                "intensity": 6,
+                "duration_minutes": 18,
+                "release_rhythm": "intermittent",
+            },
+            "response_text": "Woody mode enabled.",
+        }
+
+    async def fake_execute_device(_control_json):
+        return True
+
+    async def fake_tts(*_args, **_kwargs):
+        return b"audio-bytes"
+
+    monkeypatch.setattr(command_executor_module, "CommandRepository", FakeRepository)
+    monkeypatch.setattr(command_executor_module.intent_parser, "parse_command", fake_parse_command)
+    monkeypatch.setattr(command_executor_module.device_controller, "execute_command", fake_execute_device)
+    monkeypatch.setattr(command_executor_module.tts_client, "synthesize", fake_tts)
+
+    events: list[str] = []
+
+    async def on_event(event_type, _event_data):
+        events.append(event_type)
+
+    service = CommandExecutorService()
+    result = await service.execute_command("set woody", session=object(), on_event=on_event)
+
+    assert result["status"] == "executed"
+    assert "llm_processing" in events
+    assert "execution_complete" in events
