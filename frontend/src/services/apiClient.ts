@@ -53,6 +53,12 @@ export const getWebSocketURL = (endpoint: string): string => {
   return `${wsProtocol}//${host}/api${endpoint}`;
 };
 
+export interface WebSocketManagerOptions {
+  autoReconnect?: boolean;
+  maxReconnectAttempts?: number;
+  reconnectDelay?: number;
+}
+
 /**
  * WebSocket connection manager.
  * Handles connection lifecycle and reconnection logic.
@@ -60,9 +66,10 @@ export const getWebSocketURL = (endpoint: string): string => {
 export class WebSocketManager {
   private ws: WebSocket | null = null;
   private url: string;
+  private autoReconnect: boolean;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 2000; // 2 seconds
+  private maxReconnectAttempts: number;
+  private reconnectDelay: number;
   private reconnectTimer: number | null = null;
   private isIntentionallyClosed = false;
 
@@ -72,8 +79,11 @@ export class WebSocketManager {
   public onError: ((error: Event) => void) | null = null;
   public onClose: (() => void) | null = null;
 
-  constructor(endpoint: string) {
+  constructor(endpoint: string, options: WebSocketManagerOptions = {}) {
     this.url = getWebSocketURL(endpoint);
+    this.autoReconnect = options.autoReconnect ?? true;
+    this.maxReconnectAttempts = options.maxReconnectAttempts ?? 5;
+    this.reconnectDelay = options.reconnectDelay ?? 2000;
   }
 
   /**
@@ -111,7 +121,7 @@ export class WebSocketManager {
         if (this.onClose) this.onClose();
 
         // Attempt reconnection if not intentionally closed
-        if (!this.isIntentionallyClosed) {
+        if (!this.isIntentionallyClosed && this.autoReconnect) {
           this.attemptReconnect();
         }
       };
@@ -124,8 +134,13 @@ export class WebSocketManager {
   /**
    * Send message to WebSocket server.
    */
-  send(data: any): void {
+  send(data: unknown): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
+      if (data instanceof Blob || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+        this.ws.send(data);
+        return;
+      }
+
       const message = typeof data === 'string' ? data : JSON.stringify(data);
       this.ws.send(message);
     } else {

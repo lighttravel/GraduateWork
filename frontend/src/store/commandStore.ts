@@ -16,6 +16,7 @@ interface CommandStore {
 
   // Latest command
   currentCommand: {
+    commandId: string | null;
     userInput: string;
     controlJson: ControlJson | null;
     responseText: string | null;
@@ -36,6 +37,7 @@ interface CommandStore {
   // Actions
   setDeviceStatus: (status: DeviceStatus) => void;
   setCurrentCommand: (command: {
+    commandId: string | null;
     userInput: string;
     controlJson: ControlJson | null;
     responseText: string | null;

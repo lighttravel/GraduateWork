@@ -11,6 +11,7 @@ import sys
 
 from config import settings, validate_settings
 from database import init_db, close_db
+from middleware.error_handlers import register_error_handlers
 
 # Configure logging
 logging.basicConfig(
@@ -52,6 +53,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+register_error_handlers(app)
 
 # Configure CORS
 app.add_middleware(
@@ -97,16 +100,13 @@ async def root():
 
 
 # Import and register routers
-from routers import asr_ws, tts, command_ws
+from routers import asr_ws, tts, command_ws, feedback, export
 
 app.include_router(asr_ws.router, prefix="/api", tags=["ASR"])
 app.include_router(tts.router, prefix="/api", tags=["TTS"])
 app.include_router(command_ws.router, prefix="/api", tags=["Commands"])
-
-# Routers to be added in later phases:
-# from routers import feedback, export
-# app.include_router(feedback.router, prefix="/api", tags=["Feedback"])
-# app.include_router(export.router, prefix="/api", tags=["Export"])
+app.include_router(feedback.router, prefix="/api", tags=["Feedback"])
+app.include_router(export.router, prefix="/api", tags=["Export"])
 
 
 if __name__ == "__main__":
