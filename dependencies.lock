@@ -1,10 +1,24 @@
 dependencies:
+  dl_fft:
+    dependencies: []
+    source:
+      path: E:\graduatework\AIchatesp32\components\dl_fft
+      type: local
+    version: 0.3.1
+  esp-dsp:
+    dependencies: []
+    source:
+      path: E:\graduatework\AIchatesp32\components\esp-dsp
+      type: local
+    version: 1.7.0
   idf:
     source:
       type: idf
     version: 5.5.0
 direct_dependencies:
+- espressif/dl_fft
+- espressif/esp-dsp
 - idf
-manifest_hash: af810ea91413da793102117d982878c1e81c7660046ed47ca82627ec7333fe77
+manifest_hash: 37aac058de7520a4b09ec7b240a4fb8e3d1c779ba427cf3608ab73b8515dc664
 target: esp32s3
 version: 2.0.0
