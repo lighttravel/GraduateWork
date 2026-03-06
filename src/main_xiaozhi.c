@@ -338,12 +338,12 @@ static esp_err_t init_wake_module(void)
     wakenet_config_t config = {
         .sample_rate = I2S_SAMPLE_RATE,
         .vad_enable = true,
-        .vad_threshold = 0.5f,
+        .vad_threshold = 0.2f,
         .aec_enable = false,
         .aec_filter = false,
     };
 
-    strlcpy(config.wake_word, "xiaozhi", sizeof(config.wake_word));
+    strlcpy(config.wake_word, "nihaoxiaozhi", sizeof(config.wake_word));
     return wakenet_init(&config, wakenet_event_callback, NULL);
 }
 
@@ -530,6 +530,7 @@ static esp_err_t speak_reply(void)
         pdFALSE,
         pdMS_TO_TICKS(TTS_TIMEOUT_MS));
 
+    (void)tts_module_stop();
     (void)audio_manager_stop_tts_playback();
 
     if ((bits & EVT_TTS_DONE) == 0) {

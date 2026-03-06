@@ -468,7 +468,6 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
                 break;
             }
 
-            static int s_ws_dbg_count = 0;
             bool treat_as_text = false;
             bool treat_as_binary = false;
             uint8_t opcode = ws_opcode_normalize(data->op_code);
@@ -494,14 +493,6 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
                 break;
             } else if (opcode == WS_TRANSPORT_OPCODES_PING || opcode == WS_TRANSPORT_OPCODES_PONG) {
                 break;
-            }
-
-            if (s_ws_dbg_count < 50) {
-                ESP_LOGW(TAG, "WS_DATA[%d] raw_op=%d op=%u fin=%d off=%d plen=%d dlen=%d text=%d bin=%d",
-                         s_ws_dbg_count, data->op_code, (unsigned)opcode, data->fin ? 1 : 0,
-                         data->payload_offset, data->payload_len, data->data_len,
-                         treat_as_text ? 1 : 0, treat_as_binary ? 1 : 0);
-                s_ws_dbg_count++;
             }
 
             if (treat_as_text) {
@@ -918,9 +909,9 @@ esp_err_t iflytek_tts_stop(void)
     }
 
     g_tts->stop_requested = true;
-    if (g_tts->state == IFLYTEK_TTS_STATE_SYNTHESIZING) {
-        g_tts->state = IFLYTEK_TTS_STATE_CONNECTED;
-    }
+    reset_json_stream_buffer();
+    disconnect_from_server();
+    g_tts->state = IFLYTEK_TTS_STATE_IDLE;
     return ESP_OK;
 }
 

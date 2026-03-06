@@ -1,111 +1,248 @@
 /**
  * @file wakenet_module.c
- * @brief 唤醒词检测模块实现 - 存根实现
- *
- * 注意: 这是一个简化的存根实现，基于能量检测的唤醒词检测。
- *
- * 完整ESP-SR集成需要：
- * 1. 添加ESP-SR组件: idf.py add-dependency "espressif/esp-sr^^1.0.0"
- * 2. 配置SPI Flash分区存储模型文件
- * 3. 参考官方示例: https://github.com/espressif/esp-sr
- *
- * 临时方案: 使用VAD (Voice Activity Detection) + 能量检测
+ * @brief Real WakeNet integration based on ESP-SR.
  */
 
 #include "wakenet_module.h"
-#include "config.h"
-#include "esp_log.h"
-#include <string.h>
+
 #include <stdlib.h>
-#include <math.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <string.h>
 
-static const char *TAG = "WAKENET_MODULE";
+#include "esp_check.h"
+#include "esp_log.h"
+#include "esp_wn_iface.h"
+#include "esp_wn_models.h"
+#include "model_path.h"
 
-// 唤醒词模块上下文
+static const char *TAG = "WAKENET";
+
+#define DEFAULT_WAKE_MODEL_KEYWORD "nihaoxiaozhi"
+#define DEFAULT_SAMPLE_RATE        16000
+#define MODEL_PARTITION_LABEL      "model"
+#define DETECTION_MODE             DET_MODE_95
+
 typedef struct {
-    wakenet_state_t state;
+    wakenet_module_state_t state;
     wakenet_event_callback_t event_cb;
     void *user_data;
-
-    // 配置
     wakenet_config_t config;
 
-    // 能量检测相关
-    float energy_threshold;      // 能量阈值
-    uint32_t sample_count;      // 样本计数
-    uint32_t speech_frames;     // 语音帧计数
-    uint32_t silence_frames;    // 静音帧计数
+    srmodel_list_t *models;
+    const esp_wn_iface_t *iface;
+    model_iface_data_t *model_data;
+    char model_name[MODEL_NAME_MAX_LENGTH];
 
-    // 最后一次检测
+    int16_t *feed_buffer;
+    int feed_chunk_size;
+    int feed_buffer_fill;
+
+    float det_threshold;
     float last_score;
+    uint32_t total_samples;
     uint32_t last_timestamp;
-
 } wakenet_module_t;
 
-static wakenet_module_t *g_wakenet = NULL;
+static wakenet_module_t *g_wakenet;
 
-// ==================== 辅助函数 ====================
-
-/**
- * @brief 计算音频能量 (RMS)
- */
-static float calculate_energy_rms(const int16_t *data, size_t len)
+static void fill_default_config(wakenet_config_t *config)
 {
-    if (data == NULL || len == 0) {
-        return 0.0f;
-    }
-
-    int64_t sum = 0;
-    for (size_t i = 0; i < len; i++) {
-        int64_t sample = data[i];
-        sum += sample * sample;
-    }
-
-    return (float)sqrt(sum / len);
+    memset(config, 0, sizeof(*config));
+    config->sample_rate = DEFAULT_SAMPLE_RATE;
+    config->vad_enable = true;
+    config->vad_threshold = 0.5f;
+    strlcpy(config->wake_word, DEFAULT_WAKE_MODEL_KEYWORD, sizeof(config->wake_word));
 }
 
-// ==================== 初始化和配置 ====================
-
-esp_err_t wakenet_init(const wakenet_config_t *config, wakenet_event_callback_t event_cb, void *user_data)
+static float map_threshold(float threshold)
 {
-    if (g_wakenet != NULL) {
-        ESP_LOGW(TAG, "唤醒词模块已初始化");
+    if (threshold < 0.0f) {
+        threshold = 0.0f;
+    }
+    if (threshold > 1.0f) {
+        threshold = 1.0f;
+    }
+
+    return 0.48f + (threshold * 0.24f);
+}
+
+static const char *pick_model_keyword(const wakenet_config_t *config)
+{
+    if (config == NULL || config->wake_word[0] == '\0') {
+        return DEFAULT_WAKE_MODEL_KEYWORD;
+    }
+
+    if (strstr(config->wake_word, "xiaozhi") != NULL) {
+        return DEFAULT_WAKE_MODEL_KEYWORD;
+    }
+
+    return config->wake_word;
+}
+
+static esp_err_t apply_detection_threshold(wakenet_module_t *ctx)
+{
+    int word_num = 1;
+
+    if (ctx == NULL || ctx->iface == NULL || ctx->model_data == NULL || ctx->iface->set_det_threshold == NULL) {
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "初始化唤醒词检测模块 (存根实现)");
+    if (ctx->iface->get_word_num != NULL) {
+        word_num = ctx->iface->get_word_num(ctx->model_data);
+    }
 
-    // 分配内存
-    g_wakenet = (wakenet_module_t *)calloc(1, sizeof(wakenet_module_t));
+    ctx->det_threshold = map_threshold(ctx->config.vad_threshold);
+
+    for (int word_index = 1; word_index <= word_num; ++word_index) {
+        (void)ctx->iface->set_det_threshold(ctx->model_data, ctx->det_threshold, word_index);
+    }
+
+    ESP_LOGI(TAG, "WakeNet threshold set to %.3f", ctx->det_threshold);
+    return ESP_OK;
+}
+
+static esp_err_t recreate_model_instance(wakenet_module_t *ctx)
+{
+    int new_chunk_size;
+
+    if (ctx == NULL || ctx->iface == NULL || ctx->model_name[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (ctx->model_data != NULL) {
+        ctx->iface->destroy(ctx->model_data);
+        ctx->model_data = NULL;
+    }
+
+    ctx->model_data = ctx->iface->create(ctx->model_name, DETECTION_MODE);
+    if (ctx->model_data == NULL) {
+        ESP_LOGE(TAG, "WakeNet create(%s) failed", ctx->model_name);
+        return ESP_FAIL;
+    }
+
+    new_chunk_size = ctx->iface->get_samp_chunksize(ctx->model_data);
+    if (new_chunk_size <= 0) {
+        ESP_LOGE(TAG, "Invalid WakeNet chunk size: %d", new_chunk_size);
+        return ESP_FAIL;
+    }
+
+    if (new_chunk_size != ctx->feed_chunk_size || ctx->feed_buffer == NULL) {
+        int16_t *new_buffer = calloc((size_t)new_chunk_size, sizeof(int16_t));
+        if (new_buffer == NULL) {
+            ESP_LOGE(TAG, "WakeNet buffer allocation failed");
+            return ESP_ERR_NO_MEM;
+        }
+
+        free(ctx->feed_buffer);
+        ctx->feed_buffer = new_buffer;
+        ctx->feed_chunk_size = new_chunk_size;
+    }
+
+    if (ctx->config.sample_rate <= 0) {
+        ctx->config.sample_rate = ctx->iface->get_samp_rate(ctx->model_data);
+    }
+
+    ctx->feed_buffer_fill = 0;
+    return apply_detection_threshold(ctx);
+}
+
+static esp_err_t load_wakenet_model(wakenet_module_t *ctx)
+{
+    char *model_name = NULL;
+    char *wake_words = NULL;
+    const char *keyword = pick_model_keyword(&ctx->config);
+
+    ctx->models = esp_srmodel_init(MODEL_PARTITION_LABEL);
+    if (ctx->models == NULL) {
+        ESP_LOGE(TAG, "esp_srmodel_init(%s) failed", MODEL_PARTITION_LABEL);
+        return ESP_FAIL;
+    }
+
+    model_name = esp_srmodel_filter(ctx->models, ESP_WN_PREFIX, keyword);
+    if (model_name == NULL && strcmp(keyword, DEFAULT_WAKE_MODEL_KEYWORD) != 0) {
+        model_name = esp_srmodel_filter(ctx->models, ESP_WN_PREFIX, DEFAULT_WAKE_MODEL_KEYWORD);
+    }
+    if (model_name == NULL) {
+        model_name = esp_srmodel_filter(ctx->models, ESP_WN_PREFIX, NULL);
+    }
+    if (model_name == NULL) {
+        ESP_LOGE(TAG, "No WakeNet model found in partition '%s'", MODEL_PARTITION_LABEL);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    ctx->iface = esp_wn_handle_from_name(model_name);
+    if (ctx->iface == NULL) {
+        ESP_LOGE(TAG, "esp_wn_handle_from_name(%s) failed", model_name);
+        return ESP_FAIL;
+    }
+
+    strlcpy(ctx->model_name, model_name, sizeof(ctx->model_name));
+    ESP_RETURN_ON_ERROR(recreate_model_instance(ctx), TAG, "Failed to create WakeNet instance");
+
+    wake_words = esp_srmodel_get_wake_words(ctx->models, model_name);
+    ESP_LOGI(TAG, "WakeNet model: %s", model_name);
+    ESP_LOGI(TAG, "Wake word(s): %s", wake_words ? wake_words : "unknown");
+    ESP_LOGI(TAG, "WakeNet sample_rate=%d chunk=%d", ctx->config.sample_rate, ctx->feed_chunk_size);
+    return ESP_OK;
+}
+
+static void unload_wakenet_model(wakenet_module_t *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+
+    if (ctx->iface != NULL && ctx->model_data != NULL) {
+        ctx->iface->destroy(ctx->model_data);
+        ctx->model_data = NULL;
+    }
+
+    free(ctx->feed_buffer);
+    ctx->feed_buffer = NULL;
+    ctx->feed_chunk_size = 0;
+    ctx->feed_buffer_fill = 0;
+    ctx->iface = NULL;
+
+    if (ctx->models != NULL) {
+        esp_srmodel_deinit(ctx->models);
+        ctx->models = NULL;
+    }
+}
+
+esp_err_t wakenet_init(const wakenet_config_t *config, wakenet_event_callback_t event_cb, void *user_data)
+{
+    esp_err_t err;
+
+    if (g_wakenet != NULL) {
+        return ESP_OK;
+    }
+
+    g_wakenet = calloc(1, sizeof(*g_wakenet));
     if (g_wakenet == NULL) {
-        ESP_LOGE(TAG, "内存分配失败");
         return ESP_ERR_NO_MEM;
     }
 
-    // 保存配置
-    if (config) {
-        memcpy(&g_wakenet->config, config, sizeof(wakenet_config_t));
-    } else {
-        // 默认配置
-        strncpy(g_wakenet->config.wake_word, "hinet_xiaozhi", 31);
-        g_wakenet->config.sample_rate = 16000;
-        g_wakenet->config.vad_enable = true;
-        g_wakenet->config.vad_threshold = 0.5f;
+    fill_default_config(&g_wakenet->config);
+    if (config != NULL) {
+        g_wakenet->config = *config;
+        if (g_wakenet->config.sample_rate <= 0) {
+            g_wakenet->config.sample_rate = DEFAULT_SAMPLE_RATE;
+        }
+        if (g_wakenet->config.wake_word[0] == '\0') {
+            strlcpy(g_wakenet->config.wake_word, DEFAULT_WAKE_MODEL_KEYWORD, sizeof(g_wakenet->config.wake_word));
+        }
     }
 
     g_wakenet->event_cb = event_cb;
     g_wakenet->user_data = user_data;
-    g_wakenet->state = WAKENET_STATE_IDLE;
+    g_wakenet->state = WAKENET_MODULE_STATE_IDLE;
 
-    // 计算能量阈值 (基于VAD阈值)
-    // VAD_THRESHOLD = 500 (来自config.h)
-    g_wakenet->energy_threshold = VAD_THRESHOLD * 2.0f;  // 简单的2倍系数
-
-    ESP_LOGI(TAG, "唤醒词: %s", g_wakenet->config.wake_word);
-    ESP_LOGI(TAG, "能量阈值: %.2f", g_wakenet->energy_threshold);
-    ESP_LOGW(TAG, "注意: 这是存根实现，基于VAD能量检测，不是真正的唤醒词识别");
+    err = load_wakenet_model(g_wakenet);
+    if (err != ESP_OK) {
+        unload_wakenet_model(g_wakenet);
+        free(g_wakenet);
+        g_wakenet = NULL;
+        return err;
+    }
 
     return ESP_OK;
 }
@@ -116,17 +253,12 @@ esp_err_t wakenet_deinit(void)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "反初始化唤醒词检测模块");
-
-    wakenet_stop();
-
+    (void)wakenet_stop();
+    unload_wakenet_model(g_wakenet);
     free(g_wakenet);
     g_wakenet = NULL;
-
     return ESP_OK;
 }
-
-// ==================== 控制接口 ====================
 
 esp_err_t wakenet_start(void)
 {
@@ -134,45 +266,42 @@ esp_err_t wakenet_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (g_wakenet->state == WAKENET_STATE_LISTENING) {
-        ESP_LOGW(TAG, "已在监听状态");
-        return ESP_OK;
-    }
+    ESP_RETURN_ON_ERROR(recreate_model_instance(g_wakenet), TAG, "Failed to reset WakeNet instance");
 
-    ESP_LOGI(TAG, "开始监听唤醒词");
-    g_wakenet->state = WAKENET_STATE_LISTENING;
-    g_wakenet->sample_count = 0;
-    g_wakenet->speech_frames = 0;
-    g_wakenet->silence_frames = 0;
+    g_wakenet->feed_buffer_fill = 0;
+    g_wakenet->total_samples = 0;
+    g_wakenet->last_timestamp = 0;
+    g_wakenet->last_score = 0.0f;
+    g_wakenet->state = WAKENET_MODULE_STATE_LISTENING;
 
-    // 触发回调
-    if (g_wakenet->event_cb) {
+    if (g_wakenet->event_cb != NULL) {
         g_wakenet->event_cb(WAKENET_EVENT_LISTENING_START, NULL, g_wakenet->user_data);
     }
 
+    ESP_LOGI(TAG, "WakeNet listening started");
     return ESP_OK;
 }
 
 esp_err_t wakenet_stop(void)
 {
-    if (g_wakenet == NULL || g_wakenet->state == WAKENET_STATE_IDLE) {
+    if (g_wakenet == NULL || g_wakenet->state == WAKENET_MODULE_STATE_IDLE) {
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "停止监听唤醒词");
-    g_wakenet->state = WAKENET_STATE_IDLE;
+    g_wakenet->feed_buffer_fill = 0;
+    g_wakenet->state = WAKENET_MODULE_STATE_IDLE;
 
-    // 触发回调
-    if (g_wakenet->event_cb) {
+    if (g_wakenet->event_cb != NULL) {
         g_wakenet->event_cb(WAKENET_EVENT_LISTENING_STOP, NULL, g_wakenet->user_data);
     }
 
+    ESP_LOGI(TAG, "WakeNet listening stopped");
     return ESP_OK;
 }
 
 esp_err_t wakenet_process_audio(const int16_t *data, size_t len)
 {
-    if (g_wakenet == NULL || g_wakenet->state != WAKENET_STATE_LISTENING) {
+    if (g_wakenet == NULL || g_wakenet->state != WAKENET_MODULE_STATE_LISTENING) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -180,73 +309,63 @@ esp_err_t wakenet_process_audio(const int16_t *data, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 计算音频能量
-    float energy = calculate_energy_rms(data, len);
-    g_wakenet->sample_count += len;
-
-    // VAD检测: 判断是否为语音
-    bool is_speech = (energy > g_wakenet->energy_threshold);
-
-    if (is_speech) {
-        g_wakenet->speech_frames++;
-        g_wakenet->silence_frames = 0;
-
-        // 简化的唤醒词检测逻辑:
-        // 检测到持续语音超过一定帧数，认为可能是唤醒词
-        // TODO: 实际应该使用ESP-SR的WakeNet模型
-
-        if (g_wakenet->speech_frames > 50) {  // 约0.5秒的语音 (16kHz, 512帧/次)
-            // 模拟检测到唤醒词
-            g_wakenet->state = WAKENET_STATE_DETECTED;
-            g_wakenet->last_score = 0.8f + (energy / 10000.0f);  // 模拟置信度
-            if (g_wakenet->last_score > 1.0f) g_wakenet->last_score = 1.0f;
-            g_wakenet->last_timestamp = g_wakenet->sample_count / g_wakenet->config.sample_rate;
-
-            ESP_LOGI(TAG, "检测到唤醒词! 置信度: %.2f", g_wakenet->last_score);
-
-            // 触发回调
-            if (g_wakenet->event_cb) {
-                wakenet_result_t result = {
-                    .score = g_wakenet->last_score,
-                    .timestamp = g_wakenet->last_timestamp
-                };
-                g_wakenet->event_cb(WAKENET_EVENT_DETECTED, &result, g_wakenet->user_data);
-            }
-
-            // 重置计数器以准备下次检测
-            g_wakenet->speech_frames = 0;
+    while (len > 0 && g_wakenet->state == WAKENET_MODULE_STATE_LISTENING) {
+        size_t copy_count = (size_t)(g_wakenet->feed_chunk_size - g_wakenet->feed_buffer_fill);
+        if (copy_count > len) {
+            copy_count = len;
         }
-    } else {
-        g_wakenet->silence_frames++;
 
-        // 如果静音持续，重置语音帧计数
-        if (g_wakenet->silence_frames > 20) {  // 约200ms静音
-            g_wakenet->speech_frames = 0;
+        memcpy(&g_wakenet->feed_buffer[g_wakenet->feed_buffer_fill], data, copy_count * sizeof(int16_t));
+        g_wakenet->feed_buffer_fill += (int)copy_count;
+        g_wakenet->total_samples += (uint32_t)copy_count;
+        data += copy_count;
+        len -= copy_count;
+
+        if (g_wakenet->feed_buffer_fill == g_wakenet->feed_chunk_size) {
+            int detect_result = (int)g_wakenet->iface->detect(g_wakenet->model_data, g_wakenet->feed_buffer);
+            g_wakenet->feed_buffer_fill = 0;
+
+            if (detect_result > 0) {
+                const char *word_name = NULL;
+
+                if (g_wakenet->iface->get_word_name != NULL) {
+                    word_name = g_wakenet->iface->get_word_name(g_wakenet->model_data, detect_result);
+                }
+
+                g_wakenet->state = WAKENET_MODULE_STATE_DETECTED;
+                g_wakenet->last_score = 1.0f;
+                g_wakenet->last_timestamp = g_wakenet->total_samples / (uint32_t)g_wakenet->config.sample_rate;
+
+                ESP_LOGI(TAG, "Wake word detected: index=%d name=%s", detect_result, word_name ? word_name : "unknown");
+
+                if (g_wakenet->event_cb != NULL) {
+                    wakenet_result_t result = {
+                        .score = g_wakenet->last_score,
+                        .timestamp = g_wakenet->last_timestamp,
+                    };
+                    g_wakenet->event_cb(WAKENET_EVENT_DETECTED, &result, g_wakenet->user_data);
+                }
+            }
         }
     }
 
     return ESP_OK;
 }
 
-// ==================== 状态查询 ====================
-
-wakenet_state_t wakenet_get_state(void)
+wakenet_module_state_t wakenet_get_state(void)
 {
-    return g_wakenet ? g_wakenet->state : WAKENET_STATE_IDLE;
+    return g_wakenet ? g_wakenet->state : WAKENET_MODULE_STATE_IDLE;
 }
 
 bool wakenet_is_listening(void)
 {
-    wakenet_state_t state = wakenet_get_state();
-    return (state == WAKENET_STATE_LISTENING);
+    return wakenet_get_state() == WAKENET_MODULE_STATE_LISTENING;
 }
 
 float wakenet_get_last_score(void)
 {
     return g_wakenet ? g_wakenet->last_score : 0.0f;
 }
-
-// ==================== 配置 ====================
 
 esp_err_t wakenet_set_vad_threshold(float threshold)
 {
@@ -259,10 +378,7 @@ esp_err_t wakenet_set_vad_threshold(float threshold)
     }
 
     g_wakenet->config.vad_threshold = threshold;
-    g_wakenet->energy_threshold = threshold * VAD_THRESHOLD * 2.0f;
-
-    ESP_LOGI(TAG, "VAD阈值更新为: %.2f, 能量阈值: %.2f", threshold, g_wakenet->energy_threshold);
-    return ESP_OK;
+    return apply_detection_threshold(g_wakenet);
 }
 
 esp_err_t wakenet_set_aec(bool enable)
@@ -272,34 +388,5 @@ esp_err_t wakenet_set_aec(bool enable)
     }
 
     g_wakenet->config.aec_enable = enable;
-    ESP_LOGI(TAG, "AEC %s", enable ? "启用" : "禁用");
     return ESP_OK;
 }
-
-// ==================== TODO说明 ====================
-
-/*
- * 完整ESP-SR集成步骤:
- *
- * 1. 添加ESP-SR组件:
- *    idf.py add-dependency "espressif/esp-sr^1.0.0"
- *    或在platformio.ini的lib_deps中添加:
- *    https://github.com/espressif/esp-sr.git
- *
- * 2. 下载模型文件到SPI Flash:
- *    - WakeNet模型: wakenet_model.bin
- *    - 从ESP-SR SDK获取模型文件
- *    - 使用partitions.csv添加模型分区
- *
- * 3. 参考官方示例代码:
- *    https://github.com/espressif/esp-sr/blob/master/examples/simple_wakenet/main/main.c
- *
- * 4. 使用ESP-SR API:
- *    - esp_sr_init()
- *    - esp_sr_process()
- *    - esp_sr_deinit()
- *
- * 5. 参考文档:
- *    - https://docs.espressif.com/projects/esp-sr/zh_CN/latest/esp32s3/getting_started/readme.html
- *    - https://docs.espressif.com/projects/esp-sr/zh_CN/latest/esp32s3/wake_word_engine/README.html
- */

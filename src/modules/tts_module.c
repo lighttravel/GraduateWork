@@ -52,53 +52,52 @@ typedef struct {
 
 static tts_module_t *g_tts = NULL;
 
+static void reset_tts_module_state_locked(void)
+{
+    if (g_tts == NULL) {
+        return;
+    }
+
+    g_tts->state = TTS_STATE_IDLE;
+    g_tts->stop_requested = true;
+    g_tts->data_cb = NULL;
+    g_tts->event_cb = NULL;
+    g_tts->user_data = NULL;
+}
+
 // ==================== 讯飞TTS回调 ====================
 
 static void iflytek_tts_event_handler(iflytek_tts_event_t event,
                                        const iflytek_tts_audio_t *audio,
                                        void *user_data)
 {
+    (void)user_data;
+
     if (!g_tts) {
         ESP_LOGE(TAG, "iflytek_tts_event_handler: g_tts is NULL!");
         return;
     }
 
-    ESP_LOGI(TAG, "========== iflytek_tts_event_handler 被调用, event=%d ==========", event);
-
     switch (event) {
+        case IFLYTEK_TTS_EVENT_CONNECTED:
+            break;
+
         case IFLYTEK_TTS_EVENT_SYNTHESIZING:
-            ESP_LOGI(TAG, "iFlytek TTS: 开始合成");
+            ESP_LOGI(TAG, "iFlytek TTS synthesis started");
             g_tts->state = TTS_STATE_DOWNLOADING;
             break;
 
         case IFLYTEK_TTS_EVENT_AUDIO_DATA:
             g_tts->state = TTS_STATE_PLAYING;
-            ESP_LOGI(TAG, "========== iFlytek TTS: 收到AUDIO_DATA事件 ==========");
-            if (audio) {
-                ESP_LOGI(TAG, "  audio=%p, audio_data=%p, len=%zu, is_final=%d",
-                         (void*)audio, (void*)audio->audio_data, audio->audio_len, audio->is_final);
-            } else {
-                ESP_LOGW(TAG, "  audio指针为NULL!");
-            }
             if (audio && audio->audio_data && audio->audio_len > 0) {
-                ESP_LOGI(TAG, "iFlytek TTS: 收到音频 %d 字节，准备回调", (int)audio->audio_len);
-                // 回调音频数据
                 if (g_tts->data_cb && !g_tts->stop_requested) {
-                    ESP_LOGI(TAG, "  调用data_cb回调 (data_cb=%p)...", (void*)g_tts->data_cb);
                     g_tts->data_cb(audio->audio_data, audio->audio_len, g_tts->user_data);
-                    ESP_LOGI(TAG, "  回调完成");
-                } else {
-                    ESP_LOGW(TAG, "  data_cb=%p, stop=%d - 无法回调!", (void*)g_tts->data_cb, g_tts->stop_requested);
                 }
-            } else if (audio && audio->is_final) {
-                ESP_LOGI(TAG, "  收到最终标志 (is_final=true)");
-            } else {
-                ESP_LOGW(TAG, "  音频数据无效，跳过回调");
             }
             break;
 
         case IFLYTEK_TTS_EVENT_COMPLETE:
-            ESP_LOGI(TAG, "iFlytek TTS: 合成完成");
+            ESP_LOGI(TAG, "iFlytek TTS synthesis complete");
             g_tts->state = TTS_STATE_IDLE;
             if (g_tts->event_cb && !g_tts->stop_requested) {
                 g_tts->event_cb(TTS_EVENT_DONE, g_tts->user_data);
@@ -106,7 +105,7 @@ static void iflytek_tts_event_handler(iflytek_tts_event_t event,
             break;
 
         case IFLYTEK_TTS_EVENT_ERROR:
-            ESP_LOGE(TAG, "iFlytek TTS: 合成错误");
+            ESP_LOGE(TAG, "iFlytek TTS synthesis error");
             g_tts->state = TTS_STATE_ERROR;
             if (g_tts->event_cb) {
                 g_tts->event_cb(TTS_EVENT_ERROR, g_tts->user_data);
@@ -114,11 +113,13 @@ static void iflytek_tts_event_handler(iflytek_tts_event_t event,
             break;
 
         case IFLYTEK_TTS_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "iFlytek TTS: 连接断开");
+            ESP_LOGW(TAG, "iFlytek TTS disconnected");
+            if (g_tts->state != TTS_STATE_DOWNLOADING && g_tts->state != TTS_STATE_PLAYING) {
+                g_tts->state = TTS_STATE_IDLE;
+            }
             break;
 
         default:
-            ESP_LOGW(TAG, "iFlytek TTS: 未知事件 %d", event);
             break;
     }
 }
@@ -251,7 +252,9 @@ esp_err_t tts_module_speak(const char *text,
     }
 
     if (ret != ESP_OK) {
+        xSemaphoreTake(g_tts->mutex, portMAX_DELAY);
         g_tts->state = TTS_STATE_ERROR;
+        xSemaphoreGive(g_tts->mutex);
         if (event_cb) {
             event_cb(TTS_EVENT_ERROR, user_data);
         }
@@ -299,7 +302,6 @@ esp_err_t tts_module_speak_iflytek(const char *text)
     }
 
     // 开始合成
-    ESP_LOGI(TAG, "调用iflytek_tts_synthesize...");
     esp_err_t ret = iflytek_tts_synthesize(text);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "iflytek_tts_synthesize失败: %s", esp_err_to_name(ret));
@@ -316,15 +318,13 @@ esp_err_t tts_module_stop(void)
     ESP_LOGI(TAG, "停止TTS合成");
 
     xSemaphoreTake(g_tts->mutex, portMAX_DELAY);
-    g_tts->stop_requested = true;
-    g_tts->state = TTS_STATE_IDLE;
+    reset_tts_module_state_locked();
+    xSemaphoreGive(g_tts->mutex);
 
     // 停止讯飞TTS
     if (g_tts->provider == TTS_PROVIDER_IFLYTEK) {
         iflytek_tts_stop();
     }
-
-    xSemaphoreGive(g_tts->mutex);
 
     return ESP_OK;
 }

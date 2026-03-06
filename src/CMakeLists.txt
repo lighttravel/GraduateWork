@@ -19,6 +19,7 @@ idf_component_register(
     REQUIRES
         driver
         es8311
+        esp-sr
         nvs_flash
         esp_wifi
         esp_event

@@ -29,6 +29,7 @@
 #include <sys/time.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 // mbedTLS用于加密
 #include "mbedtls/sha256.h"
@@ -36,6 +37,8 @@
 #include "mbedtls/md.h"
 
 static const char *TAG = "IFLYTEK";
+static const char *TLS_LOG_TAG = "esp-tls-mbedtls";
+static const char *MBEDTLS_DYNAMIC_LOG_TAG = "Dynamic Impl";
 
 // ==================== 内部配置 ====================
 
@@ -65,6 +68,7 @@ typedef struct {
     // 接收任务
     TaskHandle_t recv_task;
     volatile bool recv_task_running;
+    volatile bool disconnect_requested;
     SemaphoreHandle_t conn_mutex;
 
     // 统计
@@ -76,6 +80,49 @@ typedef struct {
 } iflytek_asr_ctx_t;
 
 static iflytek_asr_ctx_t *g_ctx = NULL;
+
+static void destroy_tls_connection(void)
+{
+    if (g_ctx == NULL || g_ctx->tls_conn == NULL) {
+        return;
+    }
+
+    esp_tls_conn_destroy(g_ctx->tls_conn);
+    g_ctx->tls_conn = NULL;
+    g_ctx->handshake_complete = false;
+}
+
+static void shutdown_tls_socket(void)
+{
+    int sockfd = -1;
+
+    if (g_ctx == NULL || g_ctx->tls_conn == NULL) {
+        return;
+    }
+
+    if (esp_tls_get_conn_sockfd(g_ctx->tls_conn, &sockfd) == ESP_OK && sockfd >= 0) {
+        shutdown(sockfd, SHUT_RDWR);
+    }
+}
+
+static void suppress_disconnect_logs(esp_log_level_t *tls_level, esp_log_level_t *dynamic_level)
+{
+    if (tls_level != NULL) {
+        *tls_level = esp_log_level_get(TLS_LOG_TAG);
+        esp_log_level_set(TLS_LOG_TAG, ESP_LOG_NONE);
+    }
+
+    if (dynamic_level != NULL) {
+        *dynamic_level = esp_log_level_get(MBEDTLS_DYNAMIC_LOG_TAG);
+        esp_log_level_set(MBEDTLS_DYNAMIC_LOG_TAG, ESP_LOG_NONE);
+    }
+}
+
+static void restore_disconnect_logs(esp_log_level_t tls_level, esp_log_level_t dynamic_level)
+{
+    esp_log_level_set(TLS_LOG_TAG, tls_level);
+    esp_log_level_set(MBEDTLS_DYNAMIC_LOG_TAG, dynamic_level);
+}
 
 static void reset_result_segments(void)
 {
@@ -491,8 +538,12 @@ static void recv_task_func(void *arg)
     ESP_LOGI(TAG, "Receive task started");
 
     while (g_ctx && g_ctx->recv_task_running && g_ctx->tls_conn) {
-        // 非阻塞读取
-        int ret = esp_tls_conn_read(g_ctx->tls_conn, recv_buf, RECV_BUF_SIZE - 1);
+        esp_tls_t *tls_conn = g_ctx->tls_conn;
+        if (tls_conn == NULL) {
+            break;
+        }
+
+        int ret = esp_tls_conn_read(tls_conn, recv_buf, RECV_BUF_SIZE - 1);
 
         if (ret > 0) {
             // 成功读取数据
@@ -525,9 +576,12 @@ static void recv_task_func(void *arg)
                 }
             }
         } else if (ret == 0) {
-            // 连接关闭
-            ESP_LOGI(TAG, "Connection closed by server");
             g_ctx->recv_task_running = false;
+            if (g_ctx->disconnect_requested) {
+                break;
+            }
+
+            ESP_LOGI(TAG, "Connection closed by server");
             if (g_ctx->event_cb) {
                 g_ctx->event_cb(IFLYTEK_ASR_EVENT_DISCONNECTED, NULL, g_ctx->user_data);
             }
@@ -535,7 +589,9 @@ static void recv_task_func(void *arg)
             // 需要更多数据，等待
             vTaskDelay(pdMS_TO_TICKS(10));
         } else {
-            // 错误
+            if (!g_ctx->recv_task_running || g_ctx->disconnect_requested || g_ctx->tls_conn == NULL) {
+                break;
+            }
             ESP_LOGE(TAG, "Receive error: %d", ret);
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -547,6 +603,7 @@ static void recv_task_func(void *arg)
     ESP_LOGI(TAG, "Receive task stopped");
     // 安全地清理任务句柄（g_ctx可能已被deinit释放）
     if (g_ctx != NULL) {
+        g_ctx->recv_task_running = false;
         g_ctx->recv_task = NULL;
     }
     vTaskDelete(NULL);
@@ -563,6 +620,7 @@ static esp_err_t start_recv_task(void)
     }
 
     g_ctx->recv_task_running = true;
+    g_ctx->disconnect_requested = false;
 
     BaseType_t ret = xTaskCreate(
         recv_task_func,
@@ -599,10 +657,6 @@ static void stop_recv_task(void)
         while (g_ctx->recv_task != NULL && wait_count < 50) {
             vTaskDelay(pdMS_TO_TICKS(10));
             wait_count++;
-        }
-        if (g_ctx->recv_task != NULL) {
-            ESP_LOGW(TAG, "Receive task did not stop gracefully");
-            g_ctx->recv_task = NULL;
         }
     }
 }
@@ -648,6 +702,7 @@ esp_err_t iflytek_asr_init(const iflytek_asr_config_t *config,
     g_ctx->event_cb = event_cb;
     g_ctx->user_data = user_data;
     g_ctx->state = IFLYTEK_ASR_STATE_IDLE;
+    g_ctx->disconnect_requested = false;
     reset_result_segments();
 
     ESP_LOGI(TAG, "ASR module initialized, APPID: %s", config->appid);
@@ -656,18 +711,19 @@ esp_err_t iflytek_asr_init(const iflytek_asr_config_t *config,
 
 esp_err_t iflytek_asr_deinit(void)
 {
+    esp_log_level_t tls_log_level = ESP_LOG_ERROR;
+    esp_log_level_t dynamic_log_level = ESP_LOG_ERROR;
+
     if (!g_ctx) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 停止接收任务
+    g_ctx->disconnect_requested = true;
+    suppress_disconnect_logs(&tls_log_level, &dynamic_log_level);
+    shutdown_tls_socket();
     stop_recv_task();
-
-    // 关闭连接
-    if (g_ctx->tls_conn) {
-        esp_tls_conn_destroy(g_ctx->tls_conn);
-        g_ctx->tls_conn = NULL;
-    }
+    destroy_tls_connection();
+    restore_disconnect_logs(tls_log_level, dynamic_log_level);
 
     // 删除互斥锁
     if (g_ctx->conn_mutex) {
@@ -876,6 +932,7 @@ esp_err_t iflytek_asr_connect(void)
     g_ctx->tls_conn = tls;
     g_ctx->handshake_complete = true;
     g_ctx->state = IFLYTEK_ASR_STATE_CONNECTED;
+    g_ctx->disconnect_requested = false;
 
     free(auth_encoded);
     free(date_encoded);
@@ -899,20 +956,21 @@ esp_err_t iflytek_asr_connect(void)
 
 esp_err_t iflytek_asr_disconnect(void)
 {
+    esp_log_level_t tls_log_level = ESP_LOG_ERROR;
+    esp_log_level_t dynamic_log_level = ESP_LOG_ERROR;
+
     if (!g_ctx) {
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "Disconnecting...");
 
-    // 停止接收任务
+    g_ctx->disconnect_requested = true;
+    suppress_disconnect_logs(&tls_log_level, &dynamic_log_level);
+    shutdown_tls_socket();
     stop_recv_task();
-
-    // 关闭TLS连接
-    if (g_ctx->tls_conn) {
-        esp_tls_conn_destroy(g_ctx->tls_conn);
-        g_ctx->tls_conn = NULL;
-    }
+    destroy_tls_connection();
+    restore_disconnect_logs(tls_log_level, dynamic_log_level);
 
     g_ctx->state = IFLYTEK_ASR_STATE_IDLE;
     g_ctx->handshake_complete = false;
