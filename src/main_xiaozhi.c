@@ -1,872 +1,592 @@
-/**
- * @file main_xiaozhi.c
- * @brief 小智AI语音助手主程序 - 完整集成版
- *
- * 整合模块:
- * - WiFi管理 (wifi_manager)
- * - 音频管理 (audio_manager)
- * - 唤醒词检测 (wakenet_module)
- * - 语音识别 (iflytek_asr)
- * - AI对话 (chat_module)
- * - 语音合成 (tts_module)
- *
- * 工作流程:
- * 1. 连接WiFi
- * 2. 初始化音频设备
- * 3. 监听唤醒词
- * 4. 检测到唤醒词后开始录音
- * 5. 将音频发送到科大讯飞ASR获取文本
- * 6. 将文本发送到AI对话模块获取回复
- * 7. 将回复通过TTS播放
- * 8. 返回步骤3等待下一次唤醒
- */
-
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <math.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/event_groups.h"
+#include <time.h>
+
+#include "esp_check.h"
+#include "esp_err.h"
 #include "esp_log.h"
-#include "esp_system.h"
-#include "nvs_flash.h"
 #include "esp_sntp.h"
+#include "nvs_flash.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
 
 #include "config.h"
-#include "middleware/wifi_manager.h"
 #include "middleware/audio_manager.h"
-#include "modules/wakenet_module.h"
-#include "modules/iflytek_asr.h"
+#include "middleware/wifi_manager.h"
 #include "modules/chat_module.h"
+#include "modules/iflytek_asr.h"
 #include "modules/tts_module.h"
+#include "modules/wakenet_module.h"
 
 static const char *TAG = "XIAOZHI";
 
-// ==================== 系统状态机 ====================
+#define EVT_WIFI_CONNECTED BIT0
+#define EVT_WAKE_WORD      BIT1
+#define EVT_ASR_FINAL      BIT2
+#define EVT_ASR_ERROR      BIT3
+#define EVT_CHAT_DONE      BIT4
+#define EVT_CHAT_ERROR     BIT5
+#define EVT_TTS_DONE       BIT6
+#define EVT_TTS_ERROR      BIT7
+#define EVT_AUDIO_ERROR    BIT8
+
+#define ASR_RECORD_SECONDS   6
+#define ASR_FINAL_TIMEOUT_MS 12000
+#define CHAT_TIMEOUT_MS      30000
+#define TTS_TIMEOUT_MS       60000
 
 typedef enum {
-    SYS_STATE_IDLE = 0,          // 空闲，等待唤醒
-    SYS_STATE_WAKE_WORD,         // 检测到唤醒词
-    SYS_STATE_LISTENING,         // 正在听用户说话
-    SYS_STATE_PROCESSING_ASR,    // 正在处理ASR
-    SYS_STATE_THINKING,          // AI正在思考
-    SYS_STATE_SPEAKING,          // 正在播放回复
-    SYS_STATE_ERROR              // 错误状态
-} system_state_t;
+    APP_STATE_BOOT = 0,
+    APP_STATE_WAIT_WAKE,
+    APP_STATE_LISTENING,
+    APP_STATE_THINKING,
+    APP_STATE_SPEAKING,
+} app_state_t;
 
-// ==================== 全局变量 ====================
+static EventGroupHandle_t g_events;
+static volatile bool g_capture_enabled;
+static bool g_chat_ready;
+static app_state_t g_app_state;
+static char g_asr_text[sizeof(((iflytek_asr_result_t *)0)->text)];
+static char g_reply_text[1024];
 
-static system_state_t g_system_state = SYS_STATE_IDLE;
-static volatile bool g_wifi_connected = false;
-static volatile bool g_asr_result_ready = false;
-static char g_asr_text[512] = {0};
-static char g_ai_response[1024] = {0};
-
-// 事件组
-static EventGroupHandle_t g_system_events;
-#define EVENT_WIFI_CONNECTED    (1 << 0)
-#define EVENT_WAKE_WORD         (1 << 1)
-#define EVENT_ASR_DONE          (1 << 2)
-#define EVENT_CHAT_DONE         (1 << 3)
-#define EVENT_TTS_DONE          (1 << 4)
-
-// ==================== 配置 ====================
-
-// 科大讯飞ASR配置
-#define IFLYTEK_APPID      "9ed12221"
-#define IFLYTEK_API_KEY    "b1ffeca6c122160445ebd4a4d69003b4"
-#define IFLYTEK_API_SECRET "NmYwODk4ODVlNGE2YWZhNGM2YjhmMjE4"
-
-// DeepSeek API配置 (用于AI对话)
-#define DEEPSEEK_API_KEY   "sk-e858af6399024030a35798cac18a961a"
-
-// ==================== 回调函数 ====================
-
-/**
- * @brief WiFi事件回调
- */
-static void wifi_event_callback(wifi_mgr_event_t event, void *user_data)
-{
-    switch (event) {
-        case WIFI_MGR_EVENT_STA_CONNECTED:
-            ESP_LOGI(TAG, "WiFi已连接");
-            g_wifi_connected = true;
-            xEventGroupSetBits(g_system_events, EVENT_WIFI_CONNECTED);
-            break;
-
-        case WIFI_MGR_EVENT_STA_DISCONNECTED:
-            ESP_LOGW(TAG, "WiFi已断开");
-            g_wifi_connected = false;
-            xEventGroupClearBits(g_system_events, EVENT_WIFI_CONNECTED);
-            break;
-
-        default:
-            break;
-    }
-}
-
-/**
- * @brief 唤醒词事件回调
- */
-static void wakenet_event_callback(wakenet_event_t event, const wakenet_result_t *result, void *user_data)
-{
-    switch (event) {
-        case WAKENET_EVENT_DETECTED:
-            ESP_LOGI(TAG, "========== 检测到唤醒词！==========");
-            ESP_LOGI(TAG, "置信度: %.2f", result->score);
-            xEventGroupSetBits(g_system_events, EVENT_WAKE_WORD);
-            break;
-
-        case WAKENET_EVENT_ERROR:
-            ESP_LOGE(TAG, "唤醒词检测错误");
-            break;
-
-        default:
-            break;
-    }
-}
-
-/**
- * @brief iFlytek ASR事件回调
- */
-static void iflytek_asr_event_callback(iflytek_asr_event_t event,
-                                        const iflytek_asr_result_t *result,
-                                        void *user_data)
-{
-    switch (event) {
-        case IFLYTEK_ASR_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "ASR已连接到服务器");
-            break;
-
-        case IFLYTEK_ASR_EVENT_LISTENING_START:
-            ESP_LOGI(TAG, "ASR开始监听");
-            break;
-
-        case IFLYTEK_ASR_EVENT_LISTENING_STOP:
-            ESP_LOGI(TAG, "ASR停止监听");
-            break;
-
-        case IFLYTEK_ASR_EVENT_RESULT_PARTIAL:
-            if (result && strlen(result->text) > 0) {
-                ESP_LOGI(TAG, "临时识别: %s", result->text);
-            }
-            break;
-
-        case IFLYTEK_ASR_EVENT_RESULT_FINAL:
-            if (result && strlen(result->text) > 0) {
-                ESP_LOGI(TAG, "========== 最终识别结果: %s ==========", result->text);
-                strncpy(g_asr_text, result->text, sizeof(g_asr_text) - 1);
-                g_asr_text[sizeof(g_asr_text) - 1] = '\0';
-                g_asr_result_ready = true;
-                xEventGroupSetBits(g_system_events, EVENT_ASR_DONE);
-            }
-            break;
-
-        case IFLYTEK_ASR_EVENT_ERROR:
-            ESP_LOGE(TAG, "ASR发生错误");
-            g_system_state = SYS_STATE_ERROR;
-            break;
-
-        case IFLYTEK_ASR_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "ASR已断开连接");
-            break;
-
-        default:
-            break;
-    }
-}
-
-/**
- * @brief Chat模块事件回调
- */
-static void chat_event_callback(chat_event_t event, const char *data, bool is_done, void *user_data)
-{
-    switch (event) {
-        case CHAT_EVENT_START:
-            ESP_LOGI(TAG, "AI开始生成回复...");
-            g_ai_response[0] = '\0';
-            break;
-
-        case CHAT_EVENT_DATA:
-            if (data) {
-                // 追加到响应缓冲区
-                strncat(g_ai_response, data, sizeof(g_ai_response) - strlen(g_ai_response) - 1);
-            }
-            break;
-
-        case CHAT_EVENT_DONE:
-            ESP_LOGI(TAG, "========== AI回复: %s ==========", g_ai_response);
-            xEventGroupSetBits(g_system_events, EVENT_CHAT_DONE);
-            break;
-
-        case CHAT_EVENT_ERROR:
-            ESP_LOGE(TAG, "Chat模块错误");
-            g_system_state = SYS_STATE_ERROR;
-            break;
-
-        default:
-            break;
-    }
-}
-
-/**
- * @brief TTS模块事件回调
- */
-static void tts_event_callback(tts_event_t event, void *user_data)
-{
-    switch (event) {
-        case TTS_EVENT_START:
-            ESP_LOGI(TAG, "开始播放TTS音频...");
-            break;
-
-        case TTS_EVENT_DONE:
-            ESP_LOGI(TAG, "TTS播放完成");
-            xEventGroupSetBits(g_system_events, EVENT_TTS_DONE);
-            break;
-
-        case TTS_EVENT_ERROR:
-            ESP_LOGE(TAG, "TTS模块错误");
-            g_system_state = SYS_STATE_ERROR;
-            break;
-
-        default:
-            break;
-    }
-}
-
-/**
- * @brief TTS音频数据回调
- */
-static void tts_data_callback(const uint8_t *data, size_t len, void *user_data)
-{
-    ESP_LOGI(TAG, "========== tts_data_callback 被调用! ==========");
-    ESP_LOGI(TAG, "  data=%p, len=%d", (void*)data, (int)len);
-
-    if (data && len > 0) {
-        ESP_LOGI(TAG, "TTS音频数据: %d 字节，准备播放", (int)len);
-        // 将TTS音频数据发送到音频管理器播放
-        esp_err_t ret = audio_manager_play_tts_audio(data, len);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "播放TTS音频失败: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGI(TAG, "播放TTS音频成功: %d 字节", (int)len);
-        }
-    } else {
-        ESP_LOGW(TAG, "TTS数据为空或长度为0");
-    }
-}
-
-/**
- * @brief 录音数据回调 - 将音频发送到ASR或唤醒词检测
- * @param data 音频数据 (PCM 16-bit 16kHz)
- * @param len 数据长度
- * @param user_data 用户数据
- */
-static void audio_record_callback(uint8_t *data, size_t len, void *user_data)
-{
-    // 根据系统状态决定音频数据的处理方式
-    if (g_system_state == SYS_STATE_LISTENING && iflytek_asr_is_listening()) {
-        // ASR模式：将录音数据发送到讯飞ASR
-        esp_err_t ret = iflytek_asr_send_audio(data, len);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "发送音频到ASR失败: %s", esp_err_to_name(ret));
-        }
-    } else if (g_system_state == SYS_STATE_IDLE && wakenet_is_listening()) {
-        // 唤醒词检测模式：将音频送入唤醒词检测
-        wakenet_process_audio((const int16_t *)data, len / 2);
-    }
-}
-
-// ==================== 初始化函数 ====================
-
-/**
- * @brief 初始化NVS
- */
-static esp_err_t init_nvs(void)
+static esp_err_t init_nvs_storage(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS需要擦除...");
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     return ret;
 }
 
-/**
- * @brief 初始化SNTP时间同步
- */
-static esp_err_t init_sntp(void)
+static esp_err_t init_sntp_time(void)
 {
-    ESP_LOGI(TAG, "初始化SNTP时间同步...");
+    ESP_LOGI(TAG, "SNTP sync starting");
 
-    // 设置SNTP操作模式
+    esp_sntp_stop();
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-
-    // 设置SNTP服务器 (优先使用中国服务器)
-    esp_sntp_setservername(0, "ntp.aliyun.com");      // 阿里云NTP (中国最快)
-    esp_sntp_setservername(1, "cn.ntp.org.cn");       // 中国NTP服务器
-    esp_sntp_setservername(2, "ntp.tencent.com");     // 腾讯云NTP
-
-    // 启动SNTP
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "cn.ntp.org.cn");
+    esp_sntp_setservername(2, "ntp.tencent.com");
     esp_sntp_init();
 
-    // 等待时间同步 (最多30秒，更长的等待时间)
-    int retry = 0;
-    const int retry_count = 60;
-    while (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
-        ESP_LOGI(TAG, "等待时间同步... (%d/%d)", retry, retry_count);
+    for (int retry = 0; retry < 60; ++retry) {
+        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            time_t now;
+            struct tm timeinfo;
+            char time_buf[32];
+
+            time(&now);
+            localtime_r(&now, &timeinfo);
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+            ESP_LOGI(TAG, "SNTP synced: %s", time_buf);
+            return ESP_OK;
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-        time_t now;
-        char strftime_buf[64];
-        time(&now);
-        struct tm timeinfo;
-        localtime_r(&now, &timeinfo);
-        strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-        ESP_LOGI(TAG, "SNTP时间同步成功: %s", strftime_buf);
-        return ESP_OK;
-    } else {
-        ESP_LOGW(TAG, "SNTP时间同步超时，继续运行");
-        return ESP_ERR_TIMEOUT;
+    ESP_LOGW(TAG, "SNTP timeout, TLS auth may be unstable");
+    return ESP_ERR_TIMEOUT;
+}
+
+static void wifi_event_callback(wifi_mgr_event_t event, void *user_data)
+{
+    (void)user_data;
+
+    if (event == WIFI_MGR_EVENT_STA_CONNECTED) {
+        xEventGroupSetBits(g_events, EVT_WIFI_CONNECTED);
+    } else if (event == WIFI_MGR_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(g_events, EVT_WIFI_CONNECTED);
     }
 }
 
-/**
- * @brief 初始化WiFi
- */
-static esp_err_t init_wifi(void)
+static esp_err_t init_wifi_connection(void)
 {
-    ESP_LOGI(TAG, "初始化WiFi...");
-
-    esp_err_t ret = wifi_manager_init(wifi_event_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi管理器初始化失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // 配置STA模式
     wifi_sta_config_t sta_config = {0};
+
+    ESP_RETURN_ON_ERROR(wifi_manager_init(wifi_event_callback, NULL), TAG, "wifi_manager_init failed");
+
     strncpy((char *)sta_config.ssid, DEFAULT_WIFI_SSID, sizeof(sta_config.ssid) - 1);
     strncpy((char *)sta_config.password, DEFAULT_WIFI_PASSWORD, sizeof(sta_config.password) - 1);
 
-    ret = wifi_manager_start_sta(&sta_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "启动STA模式失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
+    ESP_RETURN_ON_ERROR(wifi_manager_start_sta(&sta_config), TAG, "wifi_manager_start_sta failed");
 
-    // 等待WiFi连接
-    ESP_LOGI(TAG, "等待WiFi连接...");
-    EventBits_t bits = xEventGroupWaitBits(g_system_events, EVENT_WIFI_CONNECTED,
-                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(30000));
+    EventBits_t bits = xEventGroupWaitBits(
+        g_events,
+        EVT_WIFI_CONNECTED,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
 
-    if (!(bits & EVENT_WIFI_CONNECTED)) {
-        ESP_LOGE(TAG, "WiFi连接超时");
+    if ((bits & EVT_WIFI_CONNECTED) == 0) {
         return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(TAG, "WiFi连接成功，IP: %s", wifi_manager_get_ip());
+    ESP_LOGI(TAG, "WiFi connected: %s", wifi_manager_get_ip());
     return ESP_OK;
 }
 
-/**
- * @brief 初始化音频管理器
- */
-static esp_err_t init_audio(void)
+static void audio_event_callback(audio_event_t event, void *user_data)
 {
-    ESP_LOGI(TAG, "初始化音频管理器...");
+    (void)user_data;
 
-    audio_config_t config = {
+    switch (event) {
+        case AUDIO_EVENT_RECORD_START:
+            ESP_LOGI(TAG, "record start");
+            break;
+        case AUDIO_EVENT_RECORD_STOP:
+            ESP_LOGI(TAG, "record stop");
+            break;
+        case AUDIO_EVENT_PLAY_START:
+            ESP_LOGI(TAG, "play start");
+            break;
+        case AUDIO_EVENT_PLAY_STOP:
+            ESP_LOGI(TAG, "play stop");
+            break;
+        case AUDIO_EVENT_ERROR:
+            ESP_LOGE(TAG, "audio error");
+            xEventGroupSetBits(g_events, EVT_AUDIO_ERROR);
+            break;
+        default:
+            break;
+    }
+}
+
+static void wakenet_event_callback(wakenet_event_t event, const wakenet_result_t *result, void *user_data)
+{
+    (void)user_data;
+
+    if (event == WAKENET_EVENT_DETECTED) {
+        ESP_LOGI(TAG, "wake detected score=%.2f", result ? result->score : 0.0f);
+        xEventGroupSetBits(g_events, EVT_WAKE_WORD);
+    } else if (event == WAKENET_EVENT_ERROR) {
+        ESP_LOGE(TAG, "wake module error");
+        xEventGroupSetBits(g_events, EVT_AUDIO_ERROR);
+    }
+}
+
+static void asr_event_callback(iflytek_asr_event_t event,
+                               const iflytek_asr_result_t *result,
+                               void *user_data)
+{
+    (void)user_data;
+
+    switch (event) {
+        case IFLYTEK_ASR_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "ASR connected");
+            break;
+
+        case IFLYTEK_ASR_EVENT_LISTENING_START:
+            ESP_LOGI(TAG, "ASR listening started");
+            break;
+
+        case IFLYTEK_ASR_EVENT_LISTENING_STOP:
+            ESP_LOGI(TAG, "ASR listening stopped");
+            break;
+
+        case IFLYTEK_ASR_EVENT_RESULT_PARTIAL:
+            if (result != NULL && result->text[0] != '\0') {
+                ESP_LOGI(TAG, "ASR partial: %s", result->text);
+            }
+            break;
+
+        case IFLYTEK_ASR_EVENT_RESULT_FINAL:
+            if (result != NULL) {
+                strlcpy(g_asr_text, result->text, sizeof(g_asr_text));
+                ESP_LOGI(TAG, "ASR final: %s", g_asr_text);
+            } else {
+                g_asr_text[0] = '\0';
+            }
+            xEventGroupSetBits(g_events, EVT_ASR_FINAL);
+            break;
+
+        case IFLYTEK_ASR_EVENT_ERROR:
+            ESP_LOGE(TAG, "ASR error");
+            xEventGroupSetBits(g_events, EVT_ASR_ERROR);
+            break;
+
+        case IFLYTEK_ASR_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "ASR disconnected");
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void chat_event_callback(chat_event_t event, const char *data, bool is_done, void *user_data)
+{
+    (void)is_done;
+    (void)user_data;
+
+    switch (event) {
+        case CHAT_EVENT_START:
+            g_reply_text[0] = '\0';
+            ESP_LOGI(TAG, "chat start");
+            break;
+
+        case CHAT_EVENT_DATA:
+            if (data != NULL && data[0] != '\0') {
+                strlcat(g_reply_text, data, sizeof(g_reply_text));
+            }
+            break;
+
+        case CHAT_EVENT_DONE:
+            ESP_LOGI(TAG, "chat done: %s", g_reply_text);
+            xEventGroupSetBits(g_events, EVT_CHAT_DONE);
+            break;
+
+        case CHAT_EVENT_ERROR:
+            ESP_LOGE(TAG, "chat error");
+            xEventGroupSetBits(g_events, EVT_CHAT_ERROR);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void tts_event_callback(tts_event_t event, void *user_data)
+{
+    (void)user_data;
+
+    switch (event) {
+        case TTS_EVENT_START:
+            ESP_LOGI(TAG, "TTS start");
+            break;
+        case TTS_EVENT_DONE:
+            ESP_LOGI(TAG, "TTS done");
+            xEventGroupSetBits(g_events, EVT_TTS_DONE);
+            break;
+        case TTS_EVENT_ERROR:
+            ESP_LOGE(TAG, "TTS error");
+            xEventGroupSetBits(g_events, EVT_TTS_ERROR);
+            break;
+        default:
+            break;
+    }
+}
+
+static void tts_data_callback(const uint8_t *data, size_t len, void *user_data)
+{
+    (void)user_data;
+
+    if (data == NULL || len == 0) {
+        return;
+    }
+
+    esp_err_t ret = audio_manager_play_tts_audio(data, len);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "audio_manager_play_tts_audio failed: %s", esp_err_to_name(ret));
+        xEventGroupSetBits(g_events, EVT_TTS_ERROR);
+    }
+}
+
+static void audio_data_callback(uint8_t *data, size_t len, void *user_data)
+{
+    (void)user_data;
+
+    if (data == NULL || len == 0) {
+        return;
+    }
+
+    if (g_app_state == APP_STATE_WAIT_WAKE && wakenet_is_listening()) {
+        (void)wakenet_process_audio((const int16_t *)data, len / sizeof(int16_t));
+        return;
+    }
+
+    if (g_app_state != APP_STATE_LISTENING || !g_capture_enabled || !iflytek_asr_is_listening()) {
+        return;
+    }
+
+    for (size_t offset = 0; offset < len; offset += IFLYTEK_FRAME_SIZE) {
+        size_t chunk_len = len - offset;
+        if (chunk_len > IFLYTEK_FRAME_SIZE) {
+            chunk_len = IFLYTEK_FRAME_SIZE;
+        }
+
+        esp_err_t ret = iflytek_asr_send_audio(data + offset, chunk_len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "send audio failed: %s", esp_err_to_name(ret));
+            xEventGroupSetBits(g_events, EVT_ASR_ERROR);
+            return;
+        }
+    }
+}
+
+static esp_err_t init_audio_pipeline(void)
+{
+    audio_config_t audio_cfg = {
         .sample_rate = I2S_SAMPLE_RATE,
-        .volume = AUDIO_VOLUME,
-        .vad_enabled = true,
+        .volume = 55,
+        .vad_enabled = false,
         .vad_threshold = VAD_THRESHOLD,
-        .data_cb = audio_record_callback,  // 设置录音数据回调
-        .event_cb = NULL,
+        .data_cb = audio_data_callback,
+        .event_cb = audio_event_callback,
         .user_data = NULL,
     };
 
-    esp_err_t ret = audio_manager_init(&config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "音频管理器初始化失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "音频管理器初始化成功");
-    return ESP_OK;
+    return audio_manager_init(&audio_cfg);
 }
 
-/**
- * @brief 初始化唤醒词模块
- */
-static esp_err_t init_wakenet(void)
+static esp_err_t init_wake_module(void)
 {
-    ESP_LOGI(TAG, "初始化唤醒词模块...");
-
     wakenet_config_t config = {
-        .wake_word = "hinet_xiaozhi",  // 小智唤醒词
-        .sample_rate = 16000,
+        .sample_rate = I2S_SAMPLE_RATE,
         .vad_enable = true,
         .vad_threshold = 0.5f,
-        .aec_enable = false,  // 暂时禁用AEC
+        .aec_enable = false,
         .aec_filter = false,
     };
 
-    esp_err_t ret = wakenet_init(&config, wakenet_event_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "唤醒词模块初始化失败: %s", esp_err_to_name(ret));
-        // 唤醒词模块可能不支持，使用按键触发代替
-        ESP_LOGW(TAG, "将使用手动触发代替唤醒词");
-        return ESP_OK;  // 继续运行
-    }
-
-    ESP_LOGI(TAG, "唤醒词模块初始化成功");
-    return ESP_OK;
+    strlcpy(config.wake_word, "xiaozhi", sizeof(config.wake_word));
+    return wakenet_init(&config, wakenet_event_callback, NULL);
 }
 
-/**
- * @brief 初始化科大讯飞ASR
- */
-static esp_err_t init_asr(void)
+static esp_err_t init_asr_module(void)
 {
-    ESP_LOGI(TAG, "初始化科大讯飞ASR...");
-
-    iflytek_asr_config_t config = {
+    iflytek_asr_config_t asr_cfg = {
         .appid = IFLYTEK_APPID,
         .api_key = IFLYTEK_API_KEY,
         .api_secret = IFLYTEK_API_SECRET,
-        .language = "zh_cn",
-        .domain = "iat",
+        .language = IFLYTEK_ASR_LANGUAGE,
+        .domain = IFLYTEK_ASR_DOMAIN,
         .enable_punctuation = true,
         .enable_nlp = false,
-        .sample_rate = 16000,
+        .sample_rate = I2S_SAMPLE_RATE,
     };
 
-    esp_err_t ret = iflytek_asr_init(&config, iflytek_asr_event_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ASR初始化失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "科大讯飞ASR初始化成功");
-    return ESP_OK;
+    return iflytek_asr_init(&asr_cfg, asr_event_callback, NULL);
 }
 
-/**
- * @brief 初始化Chat模块
- */
-static esp_err_t init_chat(void)
+static void init_chat_module_optional(void)
 {
-    ESP_LOGI(TAG, "初始化Chat模块...");
+    esp_err_t ret;
 
-    // TODO: 从NVS读取API密钥
-    const char *api_key = DEEPSEEK_API_KEY;
-    if (strlen(api_key) == 0) {
-        ESP_LOGW(TAG, "DeepSeek API密钥未配置，Chat功能将不可用");
-        return ESP_OK;  // 继续运行
-    }
-
-    esp_err_t ret = chat_module_init(api_key);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Chat模块初始化失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    // 设置系统提示词
-    chat_module_set_system_prompt("你是小智，一个友好、乐于助人的AI语音助手。"
-                                   "请用简洁、自然的语言回答用户的问题。"
-                                   "回答不要太长，适合语音播放。");
-
-    ESP_LOGI(TAG, "Chat模块初始化成功");
-    return ESP_OK;
-}
-
-/**
- * @brief 初始化TTS模块
- */
-static esp_err_t init_tts(void)
-{
-    ESP_LOGI(TAG, "初始化TTS模块...");
-
-    // 使用讯飞TTS（支持中文）
-    esp_err_t ret = tts_module_init(TTS_PROVIDER_IFLYTEK);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "TTS模块初始化失败: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "TTS模块初始化成功（讯飞TTS）");
-    return ESP_OK;
-}
-
-// ==================== 状态处理函数 ====================
-
-/**
- * @brief 等待唤醒词状态
- */
-static void state_wait_wake_word(void)
-{
-    ESP_LOGI(TAG, "等待唤醒词...");
-    g_system_state = SYS_STATE_IDLE;
-
-    // 开始监听唤醒词
-    wakenet_start();
-
-    // 开始录音（音频数据通过audio_record_callback送入wakenet）
-    esp_err_t ret = audio_manager_start_record();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "开始录音失败");
-        g_system_state = SYS_STATE_ERROR;
+    g_chat_ready = false;
+    if (DEEPSEEK_API_KEY[0] == '\0') {
+        ESP_LOGW(TAG, "chat disabled: no DeepSeek API key");
         return;
     }
 
-    // 等待唤醒词事件（或手动触发）
-    EventBits_t bits = xEventGroupWaitBits(g_system_events, EVENT_WAKE_WORD,
-                                            pdTRUE, pdFALSE, portMAX_DELAY);
-
-    // 检测到唤醒词后停止录音
-    audio_manager_stop_record();
-    wakenet_stop();
-
-    if (bits & EVENT_WAKE_WORD) {
-        ESP_LOGI(TAG, "进入监听状态");
-        g_system_state = SYS_STATE_WAKE_WORD;
+    ret = chat_module_init(DEEPSEEK_API_KEY);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "chat init failed: %s", esp_err_to_name(ret));
+        return;
     }
+
+    ret = chat_module_set_system_prompt("你是小智，一个简洁自然的中文语音助手。回答简短、直接，适合语音播报。");
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "chat prompt setup failed: %s", esp_err_to_name(ret));
+    }
+
+    g_chat_ready = true;
 }
 
-/**
- * @brief 监听用户说话状态
- */
-static void state_listening(void)
+static esp_err_t init_tts_module(void)
 {
-    ESP_LOGI(TAG, "开始录音...");
-    g_system_state = SYS_STATE_LISTENING;
-    g_asr_result_ready = false;
+    return tts_module_init(TTS_PROVIDER_IFLYTEK);
+}
+
+static esp_err_t wait_for_wake_word(void)
+{
+    EventBits_t bits;
+
+    g_app_state = APP_STATE_WAIT_WAKE;
+    xEventGroupClearBits(g_events, EVT_WAKE_WORD | EVT_AUDIO_ERROR);
+
+    ESP_RETURN_ON_ERROR(wakenet_start(), TAG, "wakenet_start failed");
+    ESP_RETURN_ON_ERROR(audio_manager_start_record(), TAG, "audio_manager_start_record failed");
+
+    ESP_LOGI(TAG, "waiting wake word");
+    bits = xEventGroupWaitBits(
+        g_events,
+        EVT_WAKE_WORD | EVT_AUDIO_ERROR,
+        pdTRUE,
+        pdFALSE,
+        portMAX_DELAY);
+
+    (void)audio_manager_stop_record();
+    (void)wakenet_stop();
+
+    if ((bits & EVT_AUDIO_ERROR) != 0) {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t run_asr_session(void)
+{
+    EventBits_t bits;
+
+    g_app_state = APP_STATE_LISTENING;
+    g_capture_enabled = false;
     g_asr_text[0] = '\0';
+    xEventGroupClearBits(g_events, EVT_ASR_FINAL | EVT_ASR_ERROR | EVT_AUDIO_ERROR);
 
-    // 连接ASR服务器
-    esp_err_t ret = iflytek_asr_connect();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ASR连接失败");
-        g_system_state = SYS_STATE_ERROR;
-        return;
+    ESP_RETURN_ON_ERROR(iflytek_asr_connect(), TAG, "iflytek_asr_connect failed");
+    ESP_RETURN_ON_ERROR(iflytek_asr_start_listening(), TAG, "iflytek_asr_start_listening failed");
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+    g_capture_enabled = true;
+    ESP_RETURN_ON_ERROR(audio_manager_start_record(), TAG, "audio_manager_start_record failed");
+
+    ESP_LOGW(TAG, "Speak now for %d seconds", ASR_RECORD_SECONDS);
+    vTaskDelay(pdMS_TO_TICKS(ASR_RECORD_SECONDS * 1000));
+
+    g_capture_enabled = false;
+    (void)audio_manager_stop_record();
+    (void)iflytek_asr_stop_listening();
+
+    bits = xEventGroupWaitBits(
+        g_events,
+        EVT_ASR_FINAL | EVT_ASR_ERROR | EVT_AUDIO_ERROR,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(ASR_FINAL_TIMEOUT_MS));
+
+    (void)iflytek_asr_disconnect();
+
+    if ((bits & (EVT_ASR_ERROR | EVT_AUDIO_ERROR)) != 0) {
+        return ESP_FAIL;
     }
-
-    // 等待连接稳定
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 开始听写
-    ret = iflytek_asr_start_listening();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "开始听写失败");
-        g_system_state = SYS_STATE_ERROR;
-        return;
+    if ((bits & EVT_ASR_FINAL) == 0) {
+        return ESP_ERR_TIMEOUT;
     }
+    return ESP_OK;
+}
 
-    // 开始录音（音频数据通过audio_record_callback自动发送到ASR）
-    ret = audio_manager_start_record();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "开始录音失败");
-        g_system_state = SYS_STATE_ERROR;
-        return;
-    }
-
-    // 录音最多8秒，或检测到静音后停止
-    int record_duration_ms = 8000;
-    int elapsed_ms = 0;
-    const int chunk_ms = 100;
-
-    while (elapsed_ms < record_duration_ms && g_system_state == SYS_STATE_LISTENING) {
-        vTaskDelay(pdMS_TO_TICKS(chunk_ms));
-        elapsed_ms += chunk_ms;
-
-        // 检查是否已经有识别结果
-        if (g_asr_result_ready) {
-            ESP_LOGI(TAG, "已获得识别结果，停止录音");
-            break;
-        }
-    }
-
-    // 停止录音
-    audio_manager_stop_record();
-
-    // 停止听写
-    iflytek_asr_stop_listening();
-
-    // 等待最终结果
-    if (!g_asr_result_ready) {
-        ESP_LOGI(TAG, "等待ASR最终结果...");
-        xEventGroupWaitBits(g_system_events, EVENT_ASR_DONE,
-                           pdTRUE, pdFALSE, pdMS_TO_TICKS(3000));
-    }
-
-    // 断开ASR连接
-    iflytek_asr_disconnect();
-
-    if (strlen(g_asr_text) > 0) {
-        g_system_state = SYS_STATE_PROCESSING_ASR;
+static void build_fallback_reply(void)
+{
+    if (g_asr_text[0] == '\0') {
+        strlcpy(g_reply_text, "我没听清，请再说一遍。", sizeof(g_reply_text));
     } else {
-        ESP_LOGW(TAG, "未识别到语音，返回等待状态");
-        g_system_state = SYS_STATE_IDLE;
+        snprintf(g_reply_text, sizeof(g_reply_text), "你刚才说的是：%s", g_asr_text);
     }
 }
 
-/**
- * @brief 处理ASR结果，发送到Chat
- */
-static void state_process_asr(void)
+static void build_reply_text(void)
 {
-    ESP_LOGI(TAG, "用户说: %s", g_asr_text);
-    g_system_state = SYS_STATE_THINKING;
+    EventBits_t bits;
 
-    // 发送到Chat模块
-    esp_err_t ret = chat_module_send_message(g_asr_text, chat_event_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "发送消息到Chat失败");
-        g_system_state = SYS_STATE_ERROR;
+    if (g_asr_text[0] == '\0') {
+        build_fallback_reply();
         return;
     }
 
-    // 等待Chat完成
-    EventBits_t bits = xEventGroupWaitBits(g_system_events, EVENT_CHAT_DONE,
-                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(30000));
+    if (!g_chat_ready) {
+        build_fallback_reply();
+        return;
+    }
 
-    if (bits & EVENT_CHAT_DONE) {
-        g_system_state = SYS_STATE_SPEAKING;
-    } else {
-        ESP_LOGE(TAG, "Chat响应超时");
-        g_system_state = SYS_STATE_ERROR;
+    g_app_state = APP_STATE_THINKING;
+    g_reply_text[0] = '\0';
+    xEventGroupClearBits(g_events, EVT_CHAT_DONE | EVT_CHAT_ERROR);
+
+    if (chat_module_send_message(g_asr_text, chat_event_callback, NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "chat send failed, fallback to echo reply");
+        build_fallback_reply();
+        return;
+    }
+
+    bits = xEventGroupWaitBits(
+        g_events,
+        EVT_CHAT_DONE | EVT_CHAT_ERROR,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(CHAT_TIMEOUT_MS));
+
+    if ((bits & EVT_CHAT_DONE) == 0 || g_reply_text[0] == '\0') {
+        ESP_LOGW(TAG, "chat reply unavailable, fallback to echo reply");
+        build_fallback_reply();
     }
 }
 
-/**
- * @brief 播放TTS回复
- */
-static void state_speaking(void)
+static esp_err_t speak_reply(void)
 {
-    ESP_LOGI(TAG, "播放AI回复...");
-    g_system_state = SYS_STATE_SPEAKING;
+    EventBits_t bits;
 
-    if (strlen(g_ai_response) == 0) {
-        ESP_LOGW(TAG, "AI回复为空");
-        g_system_state = SYS_STATE_IDLE;
-        return;
+    if (g_reply_text[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
     }
 
-    // 启动TTS播放
-    esp_err_t ret = audio_manager_start_tts_playback();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "启动TTS播放失败");
-        g_system_state = SYS_STATE_ERROR;
-        return;
+    g_app_state = APP_STATE_SPEAKING;
+    xEventGroupClearBits(g_events, EVT_TTS_DONE | EVT_TTS_ERROR | EVT_AUDIO_ERROR);
+
+    ESP_RETURN_ON_ERROR(audio_manager_start_tts_playback(), TAG, "audio_manager_start_tts_playback failed");
+    ESP_RETURN_ON_ERROR(tts_module_speak(g_reply_text, tts_data_callback, tts_event_callback, NULL),
+                        TAG,
+                        "tts_module_speak failed");
+
+    bits = xEventGroupWaitBits(
+        g_events,
+        EVT_TTS_DONE | EVT_TTS_ERROR | EVT_AUDIO_ERROR,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(TTS_TIMEOUT_MS));
+
+    (void)audio_manager_stop_tts_playback();
+
+    if ((bits & EVT_TTS_DONE) == 0) {
+        return ESP_FAIL;
     }
-
-    // 调用TTS模块合成并播放
-    ret = tts_module_speak(g_ai_response, tts_data_callback, tts_event_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "TTS合成失败");
-        audio_manager_stop_tts_playback();
-        g_system_state = SYS_STATE_ERROR;
-        return;
-    }
-
-    // 等待TTS完成
-    xEventGroupWaitBits(g_system_events, EVENT_TTS_DONE,
-                        pdTRUE, pdFALSE, portMAX_DELAY);
-
-    // 停止TTS播放
-    audio_manager_stop_tts_playback();
-
-    ESP_LOGI(TAG, "回复播放完成");
-    g_system_state = SYS_STATE_IDLE;
+    return ESP_OK;
 }
-
-/**
- * @brief 错误处理状态
- */
-static void state_error(void)
-{
-    ESP_LOGE(TAG, "系统进入错误状态，5秒后重置...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
-    g_system_state = SYS_STATE_IDLE;
-}
-
-/**
- * @brief 测试喇叭播放 - 使用简单PCM测试音
- */
-static void test_speaker(void)
-{
-    ESP_LOGI(TAG, "========== 开始喇叭测试 ==========");
-
-    // 设置较高音量
-    audio_manager_set_volume(100);
-
-    // ===== 步骤0: 转储 ES8311 寄存器诊断 =====
-    ESP_LOGI(TAG, "===== 步骤0: ES8311 寄存器诊断 =====");
-    audio_manager_dump_codec_registers();
-
-    // ===== 第一步：简单 PCM 测试音 (16kHz, 16-bit, mono) =====
-    ESP_LOGI(TAG, "===== 步骤1: PCM 测试音 (1kHz 正弦波 0.5秒) =====");
-
-    // 创建 1kHz 正弦波测试音 (16kHz 采样率，0.5秒 = 8000 采样点)
-    // 1kHz @ 16kHz = 每个周期 16 个采样点
-    #define TEST_TONE_SAMPLES 8000
-    static int16_t test_tone[TEST_TONE_SAMPLES];
-
-    // 生成 1kHz 正弦波 (使用查表法避免浮点运算)
-    // 一个周期的正弦波 (16个点)
-    static const int16_t sine_table[16] = {
-        0, 11585, 21213, 27246, 30000, 27246, 21213, 11585,
-        0, -11585, -21213, -27246, -30000, -27246, -21213, -11585
-    };
-
-    for (int i = 0; i < TEST_TONE_SAMPLES; i++) {
-        test_tone[i] = sine_table[i % 16];  // 循环查表
-    }
-
-    ESP_LOGI(TAG, "PCM测试音: %d 采样点, %d 字节, 持续 %.2f 秒",
-             TEST_TONE_SAMPLES, TEST_TONE_SAMPLES * 2, (float)TEST_TONE_SAMPLES / 16000.0f);
-
-    // 启动播放模式
-    esp_err_t ret = audio_manager_start_tts_playback();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "启动播放失败: %s", esp_err_to_name(ret));
-        return;
-    }
-    ESP_LOGI(TAG, "播放模式已启动");
-
-    // 播放测试音 (3次，每次间隔0.7秒)
-    ESP_LOGI(TAG, "开始播放 PCM 测试音 (3次)...");
-    for (int i = 0; i < 3; i++) {
-        ESP_LOGI(TAG, "  播放第 %d/3 次...", i + 1);
-        audio_manager_play_tts_audio((const uint8_t *)test_tone, TEST_TONE_SAMPLES * 2);
-        vTaskDelay(pdMS_TO_TICKS(700));  // 间隔 0.7 秒
-    }
-    ESP_LOGI(TAG, "PCM 测试音播放完成");
-
-    // 等待一下
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 停止播放模式
-    audio_manager_stop_tts_playback();
-
-    // ===== 第二步：TTS 语音测试 =====
-    ESP_LOGI(TAG, "===== 步骤2: TTS 语音测试 =====");
-
-    const char *test_text = "你好小智";
-
-    // 启动TTS播放模式
-    ret = audio_manager_start_tts_playback();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "启动TTS播放失败: %s", esp_err_to_name(ret));
-        return;
-    }
-    ESP_LOGI(TAG, "TTS播放模式已启动，I2S已配置");
-
-    // 调用TTS合成并播放
-    ESP_LOGI(TAG, "开始TTS合成: %s", test_text);
-    ret = tts_module_speak(test_text, tts_data_callback, tts_event_callback, NULL);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "TTS合成失败: %s", esp_err_to_name(ret));
-        audio_manager_stop_tts_playback();
-        return;
-    }
-    ESP_LOGI(TAG, "TTS请求已发送，等待音频数据...");
-
-    // 等待TTS完成（最多60秒，讯飞服务器响应可能较慢）
-    EventBits_t bits = xEventGroupWaitBits(g_system_events, EVENT_TTS_DONE,
-                                            pdTRUE, pdFALSE, pdMS_TO_TICKS(60000));
-
-    // 停止TTS播放
-    audio_manager_stop_tts_playback();
-
-    if (bits & EVENT_TTS_DONE) {
-        ESP_LOGI(TAG, "========== 喇叭测试完成 ==========");
-    } else {
-        ESP_LOGW(TAG, "========== 喇叭测试超时 ==========");
-    }
-}
-
-// ==================== 主程序 ====================
 
 void app_main(void)
 {
-    printf("\n");
+    printf("\n========================================\n");
+    printf(" XiaoZhi Main Flow: Wake -> ASR -> Reply\n");
     printf("========================================\n");
-    printf("    小智AI语音助手 v2.0\n");
-    printf("    基于ESP32 + 科大讯飞ASR\n");
-    printf("========================================\n");
-    printf("\n");
 
-    // 创建事件组
-    g_system_events = xEventGroupCreate();
-    if (!g_system_events) {
-        ESP_LOGE(TAG, "创建事件组失败");
+    g_events = xEventGroupCreate();
+    if (g_events == NULL) {
+        ESP_LOGE(TAG, "failed to create event group");
         return;
     }
 
-    // 初始化NVS
-    ESP_ERROR_CHECK(init_nvs());
+    g_app_state = APP_STATE_BOOT;
+    g_capture_enabled = false;
+    g_asr_text[0] = '\0';
+    g_reply_text[0] = '\0';
 
-    // 初始化WiFi
-    ESP_ERROR_CHECK(init_wifi());
+    ESP_ERROR_CHECK(init_nvs_storage());
+    ESP_ERROR_CHECK(init_wifi_connection());
+    (void)init_sntp_time();
+    ESP_ERROR_CHECK(init_audio_pipeline());
+    ESP_ERROR_CHECK(init_wake_module());
+    ESP_ERROR_CHECK(init_asr_module());
+    init_chat_module_optional();
+    ESP_ERROR_CHECK(init_tts_module());
 
-    // 初始化SNTP时间同步 (TLS连接需要正确的时间)
-    init_sntp();
+    ESP_LOGI(TAG, "main flow ready");
 
-    // 初始化音频
-    ESP_ERROR_CHECK(init_audio());
-
-    // 初始化各模块
-    init_wakenet();   // 唤醒词（可选）
-    ESP_ERROR_CHECK(init_asr());    // ASR（必须）
-    init_chat();      // Chat（可选）
-    ESP_ERROR_CHECK(init_tts());    // TTS（必须，用于喇叭测试）
-
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "系统初始化完成，开始运行主循环");
-    ESP_LOGI(TAG, "========================================");
-
-    // ===== 喇叭测试 =====
-    test_speaker();
-    ESP_LOGI(TAG, "喇叭测试结束，3秒后进入正常工作模式...");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    // ====================
-
-    // 主循环 - 状态机
     while (1) {
-        switch (g_system_state) {
-            case SYS_STATE_IDLE:
-                state_wait_wake_word();
-                break;
-
-            case SYS_STATE_WAKE_WORD:
-                state_listening();
-                break;
-
-            case SYS_STATE_PROCESSING_ASR:
-                state_process_asr();
-                break;
-
-            case SYS_STATE_SPEAKING:
-                state_speaking();
-                break;
-
-            case SYS_STATE_ERROR:
-                state_error();
-                break;
-
-            default:
-                g_system_state = SYS_STATE_IDLE;
-                break;
+        if (wait_for_wake_word() != ESP_OK) {
+            ESP_LOGE(TAG, "wake stage failed");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
         }
 
-        // 短暂延时防止忙循环
-        vTaskDelay(pdMS_TO_TICKS(10));
+        if (run_asr_session() != ESP_OK) {
+            ESP_LOGW(TAG, "ASR session failed or timed out");
+            strlcpy(g_reply_text, "我没听清，请再说一遍。", sizeof(g_reply_text));
+        } else {
+            build_reply_text();
+        }
+
+        ESP_LOGI(TAG, "reply text: %s", g_reply_text);
+        if (speak_reply() != ESP_OK) {
+            ESP_LOGE(TAG, "speak reply failed");
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        g_app_state = APP_STATE_WAIT_WAKE;
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

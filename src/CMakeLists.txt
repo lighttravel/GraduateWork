@@ -1,12 +1,14 @@
 idf_component_register(
     SRCS
-        "tts_smoke_test.c"
+        "main_xiaozhi.c"
         "middleware/wifi_manager.c"
         "middleware/audio_manager.c"
         "drivers/audio_driver.c"
-        "drivers/es8311_direct_tone.c"
         "drivers/es8311_codec_v2.c"
         "drivers/i2c_driver_v2.c"
+        "modules/wakenet_module.c"
+        "modules/iflytek_asr.c"
+        "modules/chat_module.c"
         "modules/tts_module.c"
         "modules/iflytek_tts.c"
     INCLUDE_DIRS

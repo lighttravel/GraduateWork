@@ -92,8 +92,8 @@ static void record_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "录音任务启动");
 
-    // 录音缓冲区 (1024 个采样点 = 2048 字节)
-    int16_t buffer[1024];
+    // Keep a single record chunk aligned with the 1280-byte iFlytek frame size.
+    int16_t buffer[640];
     const int samples = sizeof(buffer) / sizeof(int16_t);
 
     while (g_audio_mgr->state == AUDIO_STATE_RECORDING) {
@@ -117,6 +117,7 @@ static void record_task(void *pvParameters)
 
     ESP_LOGI(TAG, "录音任务结束");
     g_audio_mgr->state = AUDIO_STATE_IDLE;
+    g_audio_mgr->record_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -362,14 +363,17 @@ esp_err_t audio_manager_stop_record(void)
     g_audio_mgr->state = AUDIO_STATE_IDLE;
     xSemaphoreGive(g_audio_mgr->mutex);
 
+    // Let the record task exit its read loop before disabling the I2S path.
+    if (g_audio_mgr->record_task != NULL) {
+        int wait_count = 0;
+        while (g_audio_mgr->record_task != NULL && wait_count < 50) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            wait_count++;
+        }
+    }
+
     // 停止录音模式
     audio_driver_stop_recording(g_audio_mgr->driver);
-
-    // 等待录音任务结束
-    if (g_audio_mgr->record_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        g_audio_mgr->record_task = NULL;
-    }
 
     // 触发录音停止事件
     if (g_audio_mgr->config.event_cb) {

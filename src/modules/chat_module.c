@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_tls.h"
@@ -517,6 +518,7 @@ esp_err_t chat_module_send_message(const char *message, chat_event_callback_t ev
         .timeout_ms = 60000,  // 60秒超时
         .buffer_size = 2048,
         .buffer_size_tx = 4096,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);

@@ -13,6 +13,7 @@
  */
 
 #include "iflytek_asr.h"
+#include "esp_system.h"
 #include "esp_log.h"
 #include "esp_tls.h"
 #include "esp_crt_bundle.h"
@@ -41,7 +42,10 @@ static const char *TAG = "IFLYTEK";
 #define RECV_TASK_STACK_SIZE    4096
 #define RECV_TASK_PRIORITY      5
 #define RECV_BUF_SIZE           2048
+#define HANDSHAKE_BUF_SIZE      2048
 #define MAX_RESULT_TEXT_LEN     512
+#define MAX_RESULT_SEGMENTS     32
+#define MAX_SEGMENT_TEXT_LEN    64
 
 // ==================== 全局上下文 ====================
 
@@ -66,10 +70,54 @@ typedef struct {
     // 统计
     uint32_t frames_sent;
     uint32_t total_bytes_sent;
+    char segment_text[MAX_RESULT_SEGMENTS][MAX_SEGMENT_TEXT_LEN];
+    int max_segment_index;
 
 } iflytek_asr_ctx_t;
 
 static iflytek_asr_ctx_t *g_ctx = NULL;
+
+static void reset_result_segments(void)
+{
+    if (g_ctx == NULL) {
+        return;
+    }
+
+    memset(g_ctx->segment_text, 0, sizeof(g_ctx->segment_text));
+    g_ctx->max_segment_index = -1;
+}
+
+static void rebuild_result_text(char *out_text, size_t out_len)
+{
+    size_t offset = 0;
+
+    if (out_text == NULL || out_len == 0) {
+        return;
+    }
+
+    out_text[0] = '\0';
+    if (g_ctx == NULL) {
+        return;
+    }
+
+    for (int i = 0; i <= g_ctx->max_segment_index && i < MAX_RESULT_SEGMENTS; ++i) {
+        size_t segment_len = strnlen(g_ctx->segment_text[i], MAX_SEGMENT_TEXT_LEN);
+        if (segment_len == 0) {
+            continue;
+        }
+
+        if (offset + segment_len >= out_len) {
+            segment_len = out_len - offset - 1U;
+        }
+        if (segment_len == 0) {
+            break;
+        }
+
+        memcpy(out_text + offset, g_ctx->segment_text[i], segment_len);
+        offset += segment_len;
+        out_text[offset] = '\0';
+    }
+}
 
 // ==================== 辅助函数 ====================
 
@@ -136,6 +184,31 @@ static char* url_encode(const char *src)
     encoded[j] = '\0';
 
     return encoded;
+}
+
+static int read_http_headers(esp_tls_t *tls, char *buffer, size_t buffer_len)
+{
+    size_t total = 0;
+
+    if (tls == NULL || buffer == NULL || buffer_len < 4) {
+        return -1;
+    }
+
+    while (total + 1 < buffer_len) {
+        int ret = esp_tls_conn_read(tls, (unsigned char *)buffer + total, buffer_len - total - 1);
+        if (ret <= 0) {
+            return ret;
+        }
+
+        total += (size_t)ret;
+        buffer[total] = '\0';
+
+        if (strstr(buffer, "\r\n\r\n") != NULL) {
+            return (int)total;
+        }
+    }
+
+    return -1;
 }
 
 // ==================== WebSocket帧处理 ====================
@@ -310,10 +383,19 @@ static void parse_and_notify_result(const char *json_str)
         asr_result.is_final = (status->valueint == 2);
     }
 
+    cJSON *pgs = cJSON_GetObjectItem(result, "pgs");
+    cJSON *rg = cJSON_GetObjectItem(result, "rg");
+    int segment_index = -1;
+    cJSON *sn = cJSON_GetObjectItem(result, "sn");
+    if (sn && cJSON_IsNumber(sn)) {
+        segment_index = sn->valueint;
+    }
+
     // 解析ws (word segments)
     cJSON *ws = cJSON_GetObjectItem(result, "ws");
     if (ws && cJSON_IsArray(ws)) {
         int ws_count = cJSON_GetArraySize(ws);
+        char segment_text[MAX_SEGMENT_TEXT_LEN] = {0};
         int text_offset = 0;
 
         for (int i = 0; i < ws_count && text_offset < MAX_RESULT_TEXT_LEN - 10; i++) {
@@ -330,15 +412,46 @@ static void parse_and_notify_result(const char *json_str)
                     cJSON *w = cJSON_GetObjectItem(cw_item, "w");
                     if (w && cJSON_IsString(w)) {
                         int w_len = strlen(w->valuestring);
-                        if (text_offset + w_len < MAX_RESULT_TEXT_LEN - 1) {
-                            strcpy(&asr_result.text[text_offset], w->valuestring);
+                        if (text_offset + w_len < (int)sizeof(segment_text) - 1) {
+                            strcpy(&segment_text[text_offset], w->valuestring);
                             text_offset += w_len;
                         }
                     }
                 }
             }
         }
-        asr_result.text[text_offset] = '\0';
+        segment_text[text_offset] = '\0';
+
+        if (segment_index >= 0 && segment_index < MAX_RESULT_SEGMENTS) {
+            if (cJSON_IsString(pgs) && strcmp(pgs->valuestring, "rpl") == 0 &&
+                cJSON_IsArray(rg) && cJSON_GetArraySize(rg) >= 2) {
+                cJSON *rg_start = cJSON_GetArrayItem(rg, 0);
+                cJSON *rg_end = cJSON_GetArrayItem(rg, 1);
+                if (cJSON_IsNumber(rg_start) && cJSON_IsNumber(rg_end)) {
+                    int start = rg_start->valueint;
+                    int end = rg_end->valueint;
+                    if (start < 0) {
+                        start = 0;
+                    }
+                    if (end >= MAX_RESULT_SEGMENTS) {
+                        end = MAX_RESULT_SEGMENTS - 1;
+                    }
+                    for (int i = start; i <= end; ++i) {
+                        g_ctx->segment_text[i][0] = '\0';
+                    }
+                }
+            }
+
+            strlcpy(g_ctx->segment_text[segment_index],
+                    segment_text,
+                    sizeof(g_ctx->segment_text[segment_index]));
+            if (segment_index > g_ctx->max_segment_index) {
+                g_ctx->max_segment_index = segment_index;
+            }
+            rebuild_result_text(asr_result.text, sizeof(asr_result.text));
+        } else {
+            strlcpy(asr_result.text, segment_text, sizeof(asr_result.text));
+        }
     }
 
     // 检查动态修正标记
@@ -349,8 +462,8 @@ static void parse_and_notify_result(const char *json_str)
 
     ESP_LOGI(TAG, "ASR Result: \"%s\" (final=%d)", asr_result.text, asr_result.is_final);
 
-    // 触发回调
-    if (strlen(asr_result.text) > 0 && g_ctx->event_cb) {
+    // Always propagate a final result event, even if the recognized text is empty.
+    if (g_ctx->event_cb && (asr_result.is_final || strlen(asr_result.text) > 0)) {
         iflytek_asr_event_t event = asr_result.is_final ?
             IFLYTEK_ASR_EVENT_RESULT_FINAL : IFLYTEK_ASR_EVENT_RESULT_PARTIAL;
         g_ctx->event_cb(event, &asr_result, g_ctx->user_data);
@@ -535,6 +648,7 @@ esp_err_t iflytek_asr_init(const iflytek_asr_config_t *config,
     g_ctx->event_cb = event_cb;
     g_ctx->user_data = user_data;
     g_ctx->state = IFLYTEK_ASR_STATE_IDLE;
+    reset_result_segments();
 
     ESP_LOGI(TAG, "ASR module initialized, APPID: %s", config->appid);
     return ESP_OK;
@@ -647,7 +761,9 @@ esp_err_t iflytek_asr_connect(void)
 
     // TLS配置
     esp_tls_cfg_t tls_cfg = {
-        .skip_common_name = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .common_name = IFLYTEK_HOST,
+        .skip_common_name = false,
         .timeout_ms = 30000,
         .non_block = false,
     };
@@ -717,7 +833,7 @@ esp_err_t iflytek_asr_connect(void)
     }
 
     // 读取响应
-    char *response = (char *)malloc(1024);
+    char *response = (char *)malloc(HANDSHAKE_BUF_SIZE);
     if (!response) {
         esp_tls_conn_destroy(tls);
         free(auth_encoded);
@@ -727,9 +843,9 @@ esp_err_t iflytek_asr_connect(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ret = esp_tls_conn_read(tls, (unsigned char *)response, 1023);
-    if (ret < 0) {
-        ESP_LOGE(TAG, "Failed to read response");
+    ret = read_http_headers(tls, response, HANDSHAKE_BUF_SIZE);
+    if (ret <= 0) {
+        ESP_LOGE(TAG, "Failed to read handshake response: %d", ret);
         free(response);
         esp_tls_conn_destroy(tls);
         free(auth_encoded);
@@ -738,8 +854,8 @@ esp_err_t iflytek_asr_connect(void)
         g_ctx->state = IFLYTEK_ASR_STATE_ERROR;
         return ESP_FAIL;
     }
-
     response[ret] = '\0';
+    ESP_LOGI(TAG, "Handshake response: %.*s", ret < 200 ? ret : 200, response);
 
     // 检查响应状态码
     bool handshake_ok = (strstr(response, "HTTP/1.1 101") != NULL ||
@@ -868,6 +984,7 @@ esp_err_t iflytek_asr_start_listening(void)
         g_ctx->is_first_frame = false;
         g_ctx->frames_sent = 0;
         g_ctx->total_bytes_sent = 0;
+        reset_result_segments();
 
         ESP_LOGI(TAG, "Listening started");
 

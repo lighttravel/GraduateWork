@@ -179,7 +179,7 @@ extern "C" {
 #define SYSTEM_TASK_STACK_SIZE  (8 * 1024)    // 系统任务栈大小
 #define SYSTEM_TASK_PRIORITY    5             // 系统任务优先级
 
-#define AUDIO_TASK_STACK_SIZE   (8 * 1024)    // 音频任务栈大小
+#define AUDIO_TASK_STACK_SIZE   (12 * 1024)   // 音频任务栈大小
 #define AUDIO_TASK_PRIORITY     10            // 音频任务优先级
 
 #define HTTP_TASK_STACK_SIZE    (4 * 1024)    // HTTP任务栈大小

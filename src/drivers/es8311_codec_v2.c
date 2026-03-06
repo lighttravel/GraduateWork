@@ -16,6 +16,7 @@ static const char *TAG = "ES8311_V2";
 #define DMA_DESC_NUM 8
 #define DMA_FRAME_NUM 480
 #define MONO_TO_STEREO_BUF_SIZE 512
+#define RX_CLOCK_CHUNK_FRAMES 256
 #define WARMUP_FRAMES 240
 
 struct es8311_codec_v2_handle {
@@ -190,6 +191,7 @@ static esp_err_t create_i2s_channels(es8311_codec_v2_handle_t handle,
     };
 
     std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
     std_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_16BIT;
     std_cfg.slot_cfg.bit_shift = true;
     std_cfg.slot_cfg.left_align = false;
@@ -379,7 +381,17 @@ esp_err_t es8311_codec_v2_enable_input(es8311_codec_v2_handle_t handle, bool ena
 
     xSemaphoreTake(handle->mutex, portMAX_DELAY);
     handle->input_enabled = enable;
+
     esp_err_t ret = set_channel_state(handle->rx_handle, &handle->rx_active, enable);
+    if (ret == ESP_OK && enable) {
+        ret = set_channel_state(handle->tx_handle, &handle->tx_active, true);
+        if (ret == ESP_OK) {
+            warmup_output(handle);
+        }
+    } else if (ret == ESP_OK && !handle->output_enabled) {
+        ret = set_channel_state(handle->tx_handle, &handle->tx_active, false);
+    }
+
     xSemaphoreGive(handle->mutex);
     return ret;
 }
@@ -393,7 +405,7 @@ esp_err_t es8311_codec_v2_enable_output(es8311_codec_v2_handle_t handle, bool en
     xSemaphoreTake(handle->mutex, portMAX_DELAY);
     handle->output_enabled = enable;
 
-    esp_err_t ret = set_channel_state(handle->tx_handle, &handle->tx_active, enable);
+    esp_err_t ret = set_channel_state(handle->tx_handle, &handle->tx_active, enable || handle->input_enabled);
     if (ret == ESP_OK && enable) {
         warmup_output(handle);
         ret = es8311_voice_mute(handle->codec, false);
@@ -423,15 +435,58 @@ int es8311_codec_v2_read(es8311_codec_v2_handle_t handle, int16_t *buffer, int s
         return 0;
     }
 
-    size_t bytes_read = 0;
-    size_t bytes_to_read = (size_t)samples * sizeof(int16_t);
-    esp_err_t ret = i2s_channel_read(handle->rx_handle, buffer, bytes_to_read, &bytes_read, pdMS_TO_TICKS(1000));
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "i2s read failed: %s", esp_err_to_name(ret));
-        return -1;
+    static const int16_t silence[RX_CLOCK_CHUNK_FRAMES * 2] = {0};
+    int16_t stereo_buf[RX_CLOCK_CHUNK_FRAMES * 2];
+    int total_samples = 0;
+
+    while (total_samples < samples) {
+        int chunk = samples - total_samples;
+        if (chunk > RX_CLOCK_CHUNK_FRAMES) {
+            chunk = RX_CLOCK_CHUNK_FRAMES;
+        }
+
+        if (!handle->output_enabled) {
+            size_t clock_written = 0;
+            size_t clock_bytes = (size_t)chunk * 2U * sizeof(int16_t);
+            esp_err_t ret = i2s_channel_write(handle->tx_handle,
+                                              silence,
+                                              clock_bytes,
+                                              &clock_written,
+                                              pdMS_TO_TICKS(1000));
+            if (ret != ESP_OK || clock_written != clock_bytes) {
+                ESP_LOGW(TAG, "i2s clock write failed: %s written=%u expected=%u",
+                         esp_err_to_name(ret),
+                         (unsigned)clock_written,
+                         (unsigned)clock_bytes);
+                return -1;
+            }
+        }
+
+        size_t bytes_read = 0;
+        size_t bytes_to_read = (size_t)chunk * 2U * sizeof(int16_t);
+        esp_err_t ret = i2s_channel_read(handle->rx_handle,
+                                         stereo_buf,
+                                         bytes_to_read,
+                                         &bytes_read,
+                                         pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "i2s read failed: %s", esp_err_to_name(ret));
+            return -1;
+        }
+
+        int frames_read = (int)(bytes_read / (2U * sizeof(int16_t)));
+        if (frames_read <= 0) {
+            break;
+        }
+
+        for (int i = 0; i < frames_read; ++i) {
+            buffer[total_samples + i] = stereo_buf[i * 2];
+        }
+
+        total_samples += frames_read;
     }
 
-    return (int)(bytes_read / sizeof(int16_t));
+    return total_samples;
 }
 
 int es8311_codec_v2_write(es8311_codec_v2_handle_t handle, const int16_t *data, int samples)
