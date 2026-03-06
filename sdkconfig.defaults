@@ -1,0 +1,38 @@
+# ESP-IDF SDK Configuration Defaults
+# Enable certificate bundle for HTTPS connections
+
+# Main task stack size (increased for TLS operations with cert bundle)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+
+# Certificate Bundle
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# TLS/SSL
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y
+CONFIG_MBEDTLS_DEBUG=y
+
+# Enable SNI (Server Name Indication)
+CONFIG_MBEDTLS_SSL_SERVER_NAME_INDICATION=y
+
+# Enable TLS 1.2
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_WS_DYNAMIC_BUFFER=y
+
+# Enable necessary ciphers
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_RSA=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_RSA=y
+
+# Allow insecure TLS options (for testing only!)
+CONFIG_ESP_TLS_INSECURE=y
+# Skip server certificate verification by default (for testing only!)
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
+# The active TTS/audio path uses the legacy I2C API with the official ES8311
+# register flow. Disable the startup abort that fires when the new driver is
+# merely linked into the app.
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y

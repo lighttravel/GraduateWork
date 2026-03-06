@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size,   Flags
+# nvs:      NVS存储 (24KB)
+nvs,           data, nvs,           0x9000,  0x6000,
+# otadata:   OTA数据 (8KB)
+otadata,        data, ota,           0xF000, 0x1000,
+# app0:      主应用程序 (3MB)
+app0,          app,  ota_0,         0x10000,0x300000,
+# spiffs:    文件系统 (剩余空间约912KB)
+spiffs,         data, spiffs,         0x310000,0xE8000,

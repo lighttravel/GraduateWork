@@ -1,0 +1,30 @@
+idf_component_register(
+    SRCS
+        "tts_smoke_test.c"
+        "middleware/wifi_manager.c"
+        "middleware/audio_manager.c"
+        "drivers/audio_driver.c"
+        "drivers/es8311_direct_tone.c"
+        "drivers/es8311_codec_v2.c"
+        "drivers/i2c_driver_v2.c"
+        "modules/tts_module.c"
+        "modules/iflytek_tts.c"
+    INCLUDE_DIRS
+        "."
+        "middleware"
+        "drivers"
+        "modules"
+    REQUIRES
+        driver
+        es8311
+        nvs_flash
+        esp_wifi
+        esp_event
+        esp_netif
+        esp-tls
+        esp_websocket_client
+        esp_http_client
+        json
+        mbedtls
+        lwip
+)
