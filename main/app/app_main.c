@@ -76,7 +76,9 @@ static void handle_keys(key_state_t *previous_state)
     const key_state_t state = key_service_read();
 
     if (state.key1_pressed && !previous_state->key1_pressed) {
-        ESP_LOGI(TAG, "KEY1 pressed: start 2s microphone capture");
+        ESP_LOGI(TAG, "KEY1 pressed: play speaker tone, then start 2s microphone capture");
+        esp_err_t tone_ret = audio_manager_play_test_tone(500);
+        ESP_LOGI(TAG, "speaker tone %s", tone_ret == ESP_OK ? "OK" : esp_err_to_name(tone_ret));
         if (audio_manager_start_record() == ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(2000));
             (void)audio_manager_stop_record();
@@ -96,7 +98,7 @@ void app_main(void)
 {
     printf("\n========================================\n");
     printf(" Graduate PCB ESP32-S3 hardware demo\n");
-    printf(" KEY1: microphone capture, KEY2: ML307R network diagnostic\n");
+    printf(" KEY1: speaker tone + microphone capture, KEY2: ML307R network diagnostic\n");
     printf("========================================\n");
 
     ESP_ERROR_CHECK(init_nvs_storage());
@@ -116,4 +118,6 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+
+
 

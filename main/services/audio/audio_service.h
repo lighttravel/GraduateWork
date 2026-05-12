@@ -1,4 +1,4 @@
-#ifndef AUDIO_SERVICE_H
+﻿#ifndef AUDIO_SERVICE_H
 #define AUDIO_SERVICE_H
 
 #include <stdbool.h>
@@ -49,6 +49,7 @@ esp_err_t audio_manager_pause_record(void);
 esp_err_t audio_manager_resume_record(void);
 
 esp_err_t audio_manager_start_play(const uint8_t *data, size_t len);
+esp_err_t audio_manager_play_test_tone(uint32_t duration_ms);
 esp_err_t audio_manager_stop_play(void);
 esp_err_t audio_manager_pause_play(void);
 esp_err_t audio_manager_resume_play(void);
@@ -76,3 +77,5 @@ void audio_manager_dump_codec_registers(void);
 #endif
 
 #endif
+
+

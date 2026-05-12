@@ -1,4 +1,4 @@
-#include "audio_service.h"
+﻿#include "audio_service.h"
 
 #include <stdlib.h>
 
@@ -24,6 +24,18 @@ typedef struct {
 } audio_manager_t;
 
 static audio_manager_t *g_audio_mgr;
+
+static void audio_fill_square_wave(int16_t *samples, size_t sample_count, int16_t amplitude)
+{
+    if (samples == NULL || sample_count == 0) {
+        return;
+    }
+
+    const size_t half_period = 16;
+    for (size_t i = 0; i < sample_count; ++i) {
+        samples[i] = ((i / half_period) % 2U) == 0U ? amplitude : (int16_t)-amplitude;
+    }
+}
 
 static void notify_event(audio_event_t event)
 {
@@ -172,6 +184,7 @@ esp_err_t audio_manager_deinit(void)
         return ret;
     }
 
+    (void)audio_manager_stop_play();
     (void)audio_driver_destroy(g_audio_mgr->driver);
     vSemaphoreDelete(g_audio_mgr->mutex);
     free(g_audio_mgr);
@@ -261,13 +274,54 @@ esp_err_t audio_manager_resume_record(void)
 
 esp_err_t audio_manager_start_play(const uint8_t *data, size_t len)
 {
-    (void)data;
-    (void)len;
-    return ESP_ERR_NOT_SUPPORTED;
+    if (g_audio_mgr == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (data == NULL || len == 0 || (len % sizeof(int16_t)) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(g_audio_mgr->mutex, portMAX_DELAY);
+    if (g_audio_mgr->state != AUDIO_STATE_IDLE) {
+        xSemaphoreGive(g_audio_mgr->mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = audio_driver_start_playback(g_audio_mgr->driver);
+    if (ret == ESP_OK) {
+        g_audio_mgr->state = AUDIO_STATE_PLAYING;
+    }
+    xSemaphoreGive(g_audio_mgr->mutex);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    notify_event(AUDIO_EVENT_PLAY_START);
+    const int samples = (int)(len / sizeof(int16_t));
+    const int written = audio_driver_write(g_audio_mgr->driver, (const int16_t *)data, samples);
+    ret = written == samples ? ESP_OK : ESP_FAIL;
+
+    const esp_err_t stop_ret = audio_manager_stop_play();
+    return ret == ESP_OK ? stop_ret : ret;
 }
 
 esp_err_t audio_manager_stop_play(void)
 {
+    if (g_audio_mgr == NULL) {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(g_audio_mgr->mutex, portMAX_DELAY);
+    const bool was_playing = g_audio_mgr->state == AUDIO_STATE_PLAYING;
+    if (was_playing) {
+        g_audio_mgr->state = AUDIO_STATE_IDLE;
+    }
+    xSemaphoreGive(g_audio_mgr->mutex);
+
+    (void)audio_driver_stop_playback(g_audio_mgr->driver);
+    if (was_playing) {
+        notify_event(AUDIO_EVENT_PLAY_STOP);
+    }
     return ESP_OK;
 }
 
@@ -279,6 +333,49 @@ esp_err_t audio_manager_pause_play(void)
 esp_err_t audio_manager_resume_play(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t audio_manager_play_test_tone(uint32_t duration_ms)
+{
+    if (g_audio_mgr == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (duration_ms == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(g_audio_mgr->mutex, portMAX_DELAY);
+    if (g_audio_mgr->state != AUDIO_STATE_IDLE) {
+        xSemaphoreGive(g_audio_mgr->mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = audio_driver_start_playback(g_audio_mgr->driver);
+    if (ret == ESP_OK) {
+        g_audio_mgr->state = AUDIO_STATE_PLAYING;
+    }
+    xSemaphoreGive(g_audio_mgr->mutex);
+
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    notify_event(AUDIO_EVENT_PLAY_START);
+
+    int16_t samples[512];
+    const uint32_t sample_rate = I2S_SAMPLE_RATE_TTS;
+    uint32_t remaining = (sample_rate * duration_ms) / 1000U;
+
+    while (remaining > 0 && ret == ESP_OK) {
+        const size_t capacity = sizeof(samples) / sizeof(samples[0]);
+        const size_t chunk = remaining > capacity ? capacity : remaining;
+        audio_fill_square_wave(samples, chunk, 8000);
+        const int written = audio_driver_write(g_audio_mgr->driver, samples, (int)chunk);
+        ret = written == (int)chunk ? ESP_OK : ESP_FAIL;
+        remaining -= (uint32_t)chunk;
+    }
+
+    const esp_err_t stop_ret = audio_manager_stop_play();
+    return ret == ESP_OK ? stop_ret : ret;
 }
 
 esp_err_t audio_manager_start_tts_playback(void)
@@ -336,7 +433,7 @@ bool audio_manager_is_recording(void)
 
 bool audio_manager_is_playing(void)
 {
-    return false;
+    return audio_manager_get_state() == AUDIO_STATE_PLAYING;
 }
 
 esp_err_t audio_manager_set_vad(bool enabled)
@@ -365,3 +462,4 @@ void audio_manager_dump_codec_registers(void)
         audio_driver_dump_codec_registers(g_audio_mgr->driver);
     }
 }
+

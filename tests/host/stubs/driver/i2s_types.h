@@ -1,0 +1,7 @@
+#ifndef DRIVER_I2S_TYPES_H
+#define DRIVER_I2S_TYPES_H
+
+#define I2S_NUM_0 0
+#define I2S_BITS_PER_SAMPLE_16BIT 16
+
+#endif
