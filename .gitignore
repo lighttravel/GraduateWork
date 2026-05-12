@@ -1,0 +1,15 @@
+﻿build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+_upstream/
+.esp-idf/
+.idf-tools/
+.vscode/
+build_host/
+*.exe
+*.pyc
+__pycache__/
+monitor-*.log
+monitor-*.err

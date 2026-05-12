@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "app/app_main.c"
+        "bsp/audio/audio_board.c"
+        "bsp/audio/es8311_codec.c"
+        "services/audio/audio_service.c"
+        "services/key/key_service.c"
+        "services/ml307r/ml307r_service.c"
+    INCLUDE_DIRS
+        "."
+        "app"
+        "config"
+        "bsp/audio"
+        "services/audio"
+        "services/key"
+        "services/ml307r"
+    REQUIRES
+        driver
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_uart
+        es8311
+        nvs_flash
+)
